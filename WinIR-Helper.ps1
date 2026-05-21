@@ -1,31 +1,36 @@
-﻿param(
-    [int]$Days = 7,
+param(
+    [int]$Days = 365,
     [int]$FailedThreshold = 10,
+    [string]$StartTime = "",
+    [string]$EndTime = "",
+    [string[]]$WebRoots = @(),
+    [string[]]$WebLogDirs = @(),
+    [int]$MaxFileMB = 5,
+    [int]$MaxScanFiles = 8000,
     [switch]$AllowNonAdmin
 )
 
 # ==============================
-# WinIR-Helper v0.2
-# Windows 应急响应信息收集脚本
-# 更新重点：管理员权限检测增强、危险端口初筛降噪
+# WinIR-Helper v0.3 Web 应急响应辅助分析版
+# 重点：WebShell 文件扫描、Web 日志 IP 统计、隐藏账户检查、挖矿 IOC 提取
 # 注意：建议使用 UTF-8 with BOM 保存本脚本
 # ==============================
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$Version = "v0.2"
+$Version = "v0.3-beta"
 $CollectTime = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutputDir = Join-Path (Get-Location) "WinIR_应急响应结果_$CollectTime"
-
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "        WinIR-Helper $Version 应急采集工具" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[+] 输出目录：$OutputDir" -ForegroundColor Green
-Write-Host "[+] 日志范围：最近 $Days 天" -ForegroundColor Green
-Write-Host "[+] 高危 IP 阈值：单个 IP 登录失败次数 >= $FailedThreshold" -ForegroundColor Green
+Write-Host "[+] 默认日志范围：最近 $Days 天" -ForegroundColor Green
+Write-Host "[+] Web 文件最大扫描大小：$MaxFileMB MB" -ForegroundColor Green
+Write-Host "[+] Web 文件最大扫描数量：$MaxScanFiles" -ForegroundColor Green
 Write-Host ""
 
 # ==============================
@@ -39,20 +44,14 @@ $IsAdmin = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administ
 if (-not $IsAdmin -and -not $AllowNonAdmin) {
     Write-Host "[!] 当前不是管理员权限，无法可靠读取 Security 安全日志。" -ForegroundColor Red
     Write-Host "[!] 请右键 PowerShell，选择“以管理员身份运行”后重新执行脚本。" -ForegroundColor Yellow
-    Write-Host "[!] 如果只是测试非日志功能，可以使用参数：-AllowNonAdmin" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "示例：" -ForegroundColor Cyan
-    Write-Host "    .\WinIR-Helper.ps1" -ForegroundColor Cyan
-    Write-Host "    .\WinIR-Helper.ps1 -Days 30 -FailedThreshold 20" -ForegroundColor Cyan
-    Write-Host "    .\WinIR-Helper.ps1 -AllowNonAdmin" -ForegroundColor Cyan
-    Write-Host ""
+    Write-Host "[!] 如果只是测试 Web 文件扫描功能，可以使用参数：-AllowNonAdmin" -ForegroundColor Yellow
 
-    $PermissionNotice = @"
+    @"
 WinIR-Helper $Version 权限检测结果
 
 当前运行状态：非管理员权限
 处理结果：脚本已主动退出
-原因说明：读取 Windows Security 安全日志通常需要管理员权限。为了避免生成关键日志为空的误导性结果，v0.2 默认在非管理员权限下停止执行。
+原因说明：读取 Windows Security 安全日志通常需要管理员权限。
 
 解决方法：
 1. 右键 PowerShell
@@ -60,12 +59,9 @@ WinIR-Helper $Version 权限检测结果
 3. 重新执行脚本
 
 测试参数：
-如果仅需测试非日志采集功能，可以运行：
-.\WinIR-Helper.ps1 -AllowNonAdmin
-"@
-
-    $PermissionNotice | Out-File "$OutputDir\权限检测说明.txt" -Encoding UTF8
-    Start-Sleep -Seconds 3
+如果仅需测试 Web 文件扫描等非日志采集功能，可以运行：
+.\WinIR-Helper-v0.3-WebModule.ps1 -AllowNonAdmin
+"@ | Out-File "$OutputDir\权限检测说明.txt" -Encoding UTF8
     exit 1
 }
 
@@ -83,24 +79,17 @@ function Export-ChineseCsv {
     param(
         [Parameter(ValueFromPipeline = $true)]
         $InputObject,
-
         [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
-    begin {
-        $List = @()
-    }
-
+    begin { $List = @() }
     process {
-        if ($null -ne $InputObject) {
-            $List += $InputObject
-        }
+        if ($null -ne $InputObject) { $List += $InputObject }
     }
-
     end {
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            $List | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8BOM
+        if (@($List).Count -eq 0) {
+            [PSCustomObject]@{ "提示" = "无结果" } | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
         } else {
             $List | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
         }
@@ -108,55 +97,54 @@ function Export-ChineseCsv {
 }
 
 function Convert-EventData {
-    param(
-        [Parameter(Mandatory = $true)]
-        $Event
-    )
-
+    param([Parameter(Mandatory = $true)]$Event)
     [xml]$Xml = $Event.ToXml()
     $Data = [ordered]@{}
     $Index = 0
 
     foreach ($Item in $Xml.Event.EventData.Data) {
         $Name = [string]$Item.Name
-
-        if ([string]::IsNullOrWhiteSpace($Name)) {
-            $Name = "Data$Index"
-        }
-
-        if ($Data.Contains($Name)) {
-            $Name = "$Name$Index"
-        }
-
+        if ([string]::IsNullOrWhiteSpace($Name)) { $Name = "Data$Index" }
+        if ($Data.Contains($Name)) { $Name = "$Name$Index" }
         $Data[$Name] = $Item.'#text'
         $Index++
     }
-
     return [PSCustomObject]$Data
 }
 
-function Get-LoginEvents {
-    param(
-        [int]$EventId,
-        [int]$Days
-    )
+function Get-TimeRange {
+    $Now = Get-Date
+    $Start = $Now.AddDays(-$Days)
+    $End = $Now
 
-    $StartTime = (Get-Date).AddDays(-$Days)
+    if (-not [string]::IsNullOrWhiteSpace($StartTime)) {
+        try { $Start = [datetime]$StartTime } catch { Write-Host "[!] StartTime 格式错误，将使用最近 $Days 天。" -ForegroundColor Yellow }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($EndTime)) {
+        try { $End = [datetime]$EndTime } catch { Write-Host "[!] EndTime 格式错误，将使用当前时间。" -ForegroundColor Yellow }
+    }
+
+    return [PSCustomObject]@{ Start = $Start; End = $End }
+}
+
+function Get-LoginEvents {
+    param([int]$EventId, [datetime]$Start, [datetime]$End)
 
     try {
         $Events = Get-WinEvent -FilterHashtable @{
             LogName   = "Security"
             Id        = $EventId
-            StartTime = $StartTime
+            StartTime = $Start
+            EndTime   = $End
         } -ErrorAction Stop
     } catch {
         Write-Host "[!] 读取安全日志失败，事件 ID：$EventId" -ForegroundColor Yellow
         return @()
     }
 
-    $Result = foreach ($Event in $Events) {
+    foreach ($Event in $Events) {
         $Data = Convert-EventData -Event $Event
-
         [PSCustomObject]@{
             "时间"       = $Event.TimeCreated
             "事件ID"     = $Event.Id
@@ -170,586 +158,731 @@ function Get-LoginEvents {
             "子状态码"   = $Data.SubStatus
         }
     }
+}
 
-    return $Result
+function Get-ProcessNameById {
+    param([int]$ProcessId)
+    try { return (Get-Process -Id $ProcessId -ErrorAction Stop).ProcessName } catch { return "未知进程" }
+}
+
+function Get-ProcessPathById {
+    param([int]$ProcessId)
+    try { return (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop).ExecutablePath } catch { return "" }
 }
 
 function Test-InvalidAddress {
     param([string]$Address)
-
     if ([string]::IsNullOrWhiteSpace($Address)) { return $true }
-
-    $InvalidAddresses = @(
-        "-",
-        "*",
-        "0.0.0.0",
-        "::",
-        "::1",
-        "127.0.0.1",
-        "localhost"
-    )
-
-    return ($InvalidAddresses -contains $Address)
+    return (@("-", "*", "0.0.0.0", "::", "::1", "127.0.0.1", "localhost") -contains $Address)
 }
 
 function Test-PrivateIPv4 {
     param([string]$Address)
-
     $Ip = $null
-    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$Ip)) {
-        return $false
-    }
-
-    if ($Ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
-        return $false
-    }
-
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$Ip)) { return $false }
+    if ($Ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $false }
     $Bytes = $Ip.GetAddressBytes()
-
-    # 10.0.0.0/8
     if ($Bytes[0] -eq 10) { return $true }
-
-    # 172.16.0.0/12
     if ($Bytes[0] -eq 172 -and $Bytes[1] -ge 16 -and $Bytes[1] -le 31) { return $true }
-
-    # 192.168.0.0/16
     if ($Bytes[0] -eq 192 -and $Bytes[1] -eq 168) { return $true }
-
-    # 169.254.0.0/16
     if ($Bytes[0] -eq 169 -and $Bytes[1] -eq 254) { return $true }
-
     return $false
 }
 
 function Test-PublicRemoteAddress {
     param([string]$Address)
-
     if (Test-InvalidAddress -Address $Address) { return $false }
     if (Test-PrivateIPv4 -Address $Address) { return $false }
-
     $Ip = $null
-    if ([System.Net.IPAddress]::TryParse($Address, [ref]$Ip)) {
-        return $true
+    return [System.Net.IPAddress]::TryParse($Address, [ref]$Ip)
+}
+
+function Get-FileHashSafe {
+    param([string]$Path, [string]$Algorithm = "SHA256")
+    try { return (Get-FileHash -Path $Path -Algorithm $Algorithm -ErrorAction Stop).Hash } catch { return "" }
+}
+
+function Get-TextPreviewLines {
+    param([string]$Path, [int]$MaxLines = 500)
+    try {
+        return Get-Content -Path $Path -Encoding UTF8 -TotalCount $MaxLines -ErrorAction Stop
+    } catch {
+        try { return Get-Content -Path $Path -TotalCount $MaxLines -ErrorAction Stop } catch { return @() }
+    }
+}
+
+function Resolve-WebRoots {
+    param([string[]]$UserRoots)
+
+    $Candidates = @()
+    $Candidates += $UserRoots
+    $Candidates += @(
+        "C:\inetpub\wwwroot",
+        "D:\inetpub\wwwroot",
+        "C:\phpstudy_pro\WWW",
+        "D:\phpstudy_pro\WWW",
+        "C:\phpStudy\WWW",
+        "D:\phpStudy\WWW",
+        "C:\xampp\htdocs",
+        "D:\xampp\htdocs",
+        "C:\wamp64\www",
+        "D:\wamp64\www",
+        "C:\wwwroot",
+        "D:\wwwroot",
+        "C:\WWW",
+        "D:\WWW"
+    )
+
+    $Existing = $Candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    return @($Existing)
+}
+
+function Resolve-WebLogDirs {
+    param([string[]]$UserLogDirs)
+
+    $Candidates = @()
+    $Candidates += $UserLogDirs
+
+    # 只加入明确的 Web 日志目录，不加入 phpstudy_pro\Extensions 这种大目录
+    $Candidates += @(
+        "C:\inetpub\logs\LogFiles",
+        "D:\inetpub\logs\LogFiles",
+
+        "C:\phpstudy_pro\Extensions\Apache2.4.39\logs",
+        "C:\phpstudy_pro\Extensions\Nginx1.15.11\logs",
+        "D:\phpstudy_pro\Extensions\Apache2.4.39\logs",
+        "D:\phpstudy_pro\Extensions\Nginx1.15.11\logs",
+
+        "C:\phpStudy\PHPTutorial\Apache\logs",
+        "D:\phpStudy\PHPTutorial\Apache\logs",
+        "C:\phpStudy\PHPTutorial\nginx\logs",
+        "D:\phpStudy\PHPTutorial\nginx\logs",
+
+        "C:\xampp\apache\logs",
+        "D:\xampp\apache\logs",
+        "C:\wamp64\logs",
+        "D:\wamp64\logs"
+    )
+
+    $Existing = @()
+
+    foreach ($Path in $Candidates) {
+        if ($Path -and (Test-Path $Path)) {
+            $Existing += $Path
+        }
     }
 
+    return @($Existing | Select-Object -Unique)
+}
+
+function Test-SuspiciousWebLine {
+    param([string]$Line)
+
+    $Patterns = @(
+        "(?i)eval\s*\(",
+        "(?i)assert\s*\(",
+        "(?i)base64_decode",
+        "(?i)gzinflate",
+        "(?i)str_rot13",
+        "(?i)shell_exec",
+        "(?i)passthru",
+        "(?i)proc_open",
+        "(?i)popen\s*\(",
+        "(?i)system\s*\(",
+        "(?i)cmd\.exe",
+        "(?i)powershell",
+        "(?i)WScript\.Shell",
+        "(?i)CreateObject",
+        "(?i)Request\s*\(",
+        "(?i)Request\.Form",
+        "(?i)Request\.QueryString",
+        "(?i)\$_POST",
+        "(?i)\$_GET",
+        "(?i)\$_REQUEST",
+        "(?i)antSword|蚁剑|caidao|菜刀|冰蝎|behinder|rebeyond|webshell|shell"
+    )
+
+    foreach ($Pattern in $Patterns) {
+        if ($Line -match $Pattern) { return $true }
+    }
     return $false
 }
 
-function Get-ProcessNameById {
-    param([int]$ProcessId)
+function Extract-ShellParamCandidates {
+    param([string]$Line)
 
-    try {
-        return (Get-Process -Id $ProcessId -ErrorAction Stop).ProcessName
-    } catch {
-        return "未知进程"
+    $Results = @()
+    $RegexList = @(
+        '\$_(?:POST|GET|REQUEST)\s*\[\s*[''"]([^''"]+)[''"]\s*\]',
+        'Request(?:\.Form|\.QueryString)?\s*\(\s*[''"]([^''"]+)[''"]\s*\)',
+        'Request\s*\[\s*[''"]([^''"]+)[''"]\s*\]',
+        '(?i)(?:pass|pwd|password|key)\s*=\s*[''"]([^''"]{1,80})[''"]'
+    )
+
+    foreach ($Regex in $RegexList) {
+        $Matches = [regex]::Matches($Line, $Regex)
+        foreach ($M in $Matches) {
+            if ($M.Groups.Count -gt 1) { $Results += $M.Groups[1].Value }
+        }
     }
+
+    return @($Results | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Extract-DomainsFromText {
+    param([string]$Text)
+
+    $Results = @()
+    $DomainRegex = "(?i)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|cn|top|xyz|cc|io|me|info|biz|ru|pw|site|club|online|vip|work)"
+    $Matches = [regex]::Matches($Text, $DomainRegex)
+    foreach ($M in $Matches) { $Results += $M.Value.ToLower() }
+    return @($Results | Select-Object -Unique)
+}
+
+function Test-MiningLine {
+    param([string]$Line)
+    return ($Line -match "(?i)(xmrig|monero|xmr|stratum|pool|mining|miner|wallet|cryptonight|nicehash|nanopool|supportxmr)")
 }
 
 # ==============================
-# 1. 导出 4624 登录成功日志
+# 1. 基础 Windows 登录日志与账号采集
 # ==============================
+
+$Range = Get-TimeRange
+Write-Host "[+] 实际日志范围：$($Range.Start) 到 $($Range.End)" -ForegroundColor Green
 
 Write-Host "[+] 正在导出 4624 登录成功日志..." -ForegroundColor Cyan
-$SuccessLogons = Get-LoginEvents -EventId 4624 -Days $Days
+$SuccessLogons = Get-LoginEvents -EventId 4624 -Start $Range.Start -End $Range.End
 $SuccessLogons | Export-ChineseCsv -Path "$OutputDir\4624_登录成功日志.csv"
 
-# ==============================
-# 2. 导出 4625 登录失败日志
-# ==============================
-
 Write-Host "[+] 正在导出 4625 登录失败日志..." -ForegroundColor Cyan
-$FailedLogons = Get-LoginEvents -EventId 4625 -Days $Days
+$FailedLogons = Get-LoginEvents -EventId 4625 -Start $Range.Start -End $Range.End
 $FailedLogons | Export-ChineseCsv -Path "$OutputDir\4625_登录失败日志.csv"
 
-# ==============================
-# 3. 统计来源 IP
-# ==============================
-
 Write-Host "[+] 正在统计来源 IP..." -ForegroundColor Cyan
-
 $ExcludeIps = @("-", "127.0.0.1", "::1", "::", "0.0.0.0", "")
 $AllIpRecords = @()
-
-$AllIpRecords += $SuccessLogons | Where-Object {
-    $_."来源IP" -and ($ExcludeIps -notcontains $_."来源IP")
-} | Select-Object "时间", "事件ID", "用户名", "来源IP", "登录类型"
-
-$AllIpRecords += $FailedLogons | Where-Object {
-    $_."来源IP" -and ($ExcludeIps -notcontains $_."来源IP")
-} | Select-Object "时间", "事件ID", "用户名", "来源IP", "登录类型"
+$AllIpRecords += $SuccessLogons | Where-Object { $_."来源IP" -and ($ExcludeIps -notcontains $_."来源IP") } | Select-Object "时间", "事件ID", "用户名", "来源IP", "登录类型"
+$AllIpRecords += $FailedLogons | Where-Object { $_."来源IP" -and ($ExcludeIps -notcontains $_."来源IP") } | Select-Object "时间", "事件ID", "用户名", "来源IP", "登录类型"
 
 $MediumThreshold = [Math]::Max(3, [int][Math]::Ceiling($FailedThreshold / 2))
-
 $IpStats = foreach ($Group in ($AllIpRecords | Group-Object "来源IP")) {
     $SuccessCount = @($Group.Group | Where-Object { $_."事件ID" -eq 4624 }).Count
     $FailedCount = @($Group.Group | Where-Object { $_."事件ID" -eq 4625 }).Count
-    $TotalCount = $Group.Count
-    $FirstSeen = ($Group.Group | Sort-Object "时间" | Select-Object -First 1)."时间"
-    $LastSeen = ($Group.Group | Sort-Object "时间" -Descending | Select-Object -First 1)."时间"
-
     $RiskLevel = "低危"
     $RiskReason = "暂未发现明显异常"
-
     if ($FailedCount -ge $FailedThreshold -and $SuccessCount -gt 0) {
-        $RiskLevel = "高危"
-        $RiskReason = "该 IP 出现大量登录失败后又出现登录成功，疑似爆破成功"
+        $RiskLevel = "高危"; $RiskReason = "该 IP 出现大量登录失败后又出现登录成功，疑似爆破成功"
     } elseif ($FailedCount -ge $FailedThreshold) {
-        $RiskLevel = "高危"
-        $RiskReason = "该 IP 登录失败次数超过阈值，疑似暴力破解"
+        $RiskLevel = "高危"; $RiskReason = "该 IP 登录失败次数超过阈值，疑似暴力破解"
     } elseif ($FailedCount -ge $MediumThreshold) {
-        $RiskLevel = "中危"
-        $RiskReason = "该 IP 存在多次登录失败，建议继续观察"
-    } elseif ($FailedCount -gt 0 -and $SuccessCount -gt 0) {
-        $RiskLevel = "中危"
-        $RiskReason = "该 IP 同时存在登录失败和登录成功，需要核对是否为正常管理员行为"
+        $RiskLevel = "中危"; $RiskReason = "该 IP 存在多次登录失败，建议继续观察"
     }
-
     [PSCustomObject]@{
-        "来源IP"   = $Group.Name
-        "总次数"   = $TotalCount
+        "来源IP" = $Group.Name
+        "总次数" = $Group.Count
         "成功次数" = $SuccessCount
         "失败次数" = $FailedCount
-        "首次发现" = $FirstSeen
-        "最后发现" = $LastSeen
+        "首次发现" = ($Group.Group | Sort-Object "时间" | Select-Object -First 1)."时间"
+        "最后发现" = ($Group.Group | Sort-Object "时间" -Descending | Select-Object -First 1)."时间"
         "风险等级" = $RiskLevel
         "风险原因" = $RiskReason
     }
 }
-
 $IpStats = $IpStats | Sort-Object "失败次数", "总次数" -Descending
 $IpStats | Export-ChineseCsv -Path "$OutputDir\来源IP统计.csv"
-
-# ==============================
-# 4. 高危 IP 筛选
-# ==============================
-
-Write-Host "[+] 正在筛选高危 IP..." -ForegroundColor Cyan
-
-$HighRiskIps = $IpStats | Where-Object {
-    $_."风险等级" -eq "高危"
-}
-
-if (@($HighRiskIps).Count -gt 0) {
-    $HighRiskIps | Export-ChineseCsv -Path "$OutputDir\高危IP筛选.csv"
-    Write-Host "[!] 发现高危 IP：$(@($HighRiskIps).Count) 个" -ForegroundColor Red
-} else {
-    [PSCustomObject]@{
-        "提示" = "未发现高危 IP"
-        "判断规则" = "单个 IP 登录失败次数 >= $FailedThreshold，或大量失败后出现登录成功"
-    } | Export-ChineseCsv -Path "$OutputDir\高危IP筛选.csv"
-
-    Write-Host "[+] 未发现高危 IP。" -ForegroundColor Green
-}
-
-# ==============================
-# 5. 本地用户
-# ==============================
+$HighRiskIps = $IpStats | Where-Object { $_."风险等级" -eq "高危" }
+$HighRiskIps | Export-ChineseCsv -Path "$OutputDir\高危IP筛选.csv"
 
 Write-Host "[+] 正在导出本地用户..." -ForegroundColor Cyan
-
 try {
-    Get-LocalUser |
-        Select-Object @{
-            Name = "用户名"
-            Expression = { $_.Name }
-        }, @{
-            Name = "是否启用"
-            Expression = { $_.Enabled }
-        }, @{
-            Name = "最后登录时间"
-            Expression = { $_.LastLogon }
-        }, @{
-            Name = "密码最后设置时间"
-            Expression = { $_.PasswordLastSet }
-        }, @{
-            Name = "是否需要密码"
-            Expression = { $_.PasswordRequired }
-        }, @{
-            Name = "用户是否可改密码"
-            Expression = { $_.UserMayChangePassword }
-        }, @{
-            Name = "描述"
-            Expression = { $_.Description }
-        } |
-        Export-ChineseCsv -Path "$OutputDir\本地用户.csv"
-} catch {
-    Write-Host "[!] 本地用户导出失败。" -ForegroundColor Yellow
-    "本地用户导出失败。" | Out-File "$OutputDir\本地用户_错误.txt" -Encoding UTF8
-}
+    Get-LocalUser | Select-Object @{
+        Name = "用户名"; Expression = { $_.Name }
+    }, @{
+        Name = "是否启用"; Expression = { $_.Enabled }
+    }, @{
+        Name = "最后登录时间"; Expression = { $_.LastLogon }
+    }, @{
+        Name = "密码最后设置时间"; Expression = { $_.PasswordLastSet }
+    }, @{
+        Name = "描述"; Expression = { $_.Description }
+    } | Export-ChineseCsv -Path "$OutputDir\本地用户.csv"
+} catch { "本地用户导出失败。" | Out-File "$OutputDir\本地用户_错误.txt" -Encoding UTF8 }
 
-# ==============================
-# 6. 管理员组成员
-# ==============================
-
-Write-Host "[+] 正在导出管理员组成员..." -ForegroundColor Cyan
-
+Write-Host "[+] 正在检查隐藏账户..." -ForegroundColor Cyan
+$HiddenAccountResults = @()
 try {
-    $AdminGroup = Get-LocalGroup | Where-Object {
-        $_.SID.Value -eq "S-1-5-32-544" -or $_.SID -eq "S-1-5-32-544"
-    }
-
-    if ($AdminGroup) {
-        Get-LocalGroupMember -Group $AdminGroup.Name |
-            Select-Object @{
-                Name = "成员名称"
-                Expression = { $_.Name }
-            }, @{
-                Name = "对象类型"
-                Expression = { $_.ObjectClass }
-            }, @{
-                Name = "来源"
-                Expression = { $_.PrincipalSource }
-            } |
-            Export-ChineseCsv -Path "$OutputDir\管理员组成员.csv"
-    } else {
-        "未找到本地管理员组。" | Out-File "$OutputDir\管理员组成员.txt" -Encoding UTF8
-    }
-} catch {
-    Write-Host "[!] 管理员组成员导出失败。" -ForegroundColor Yellow
-    "管理员组成员导出失败。" | Out-File "$OutputDir\管理员组成员_错误.txt" -Encoding UTF8
-}
-
-# ==============================
-# 7. 启动项
-# ==============================
-
-Write-Host "[+] 正在导出启动项..." -ForegroundColor Cyan
-
-try {
-    Get-CimInstance Win32_StartupCommand |
-        Select-Object @{
-            Name = "启动项名称"
-            Expression = { $_.Name }
-        }, @{
-            Name = "启动命令"
-            Expression = { $_.Command }
-        }, @{
-            Name = "启动位置"
-            Expression = { $_.Location }
-        }, @{
-            Name = "所属用户"
-            Expression = { $_.User }
-        } |
-        Export-ChineseCsv -Path "$OutputDir\启动项.csv"
-} catch {
-    Write-Host "[!] 启动项导出失败。" -ForegroundColor Yellow
-    "启动项导出失败。" | Out-File "$OutputDir\启动项_错误.txt" -Encoding UTF8
-}
-
-# ==============================
-# 8. 计划任务
-# ==============================
-
-Write-Host "[+] 正在导出计划任务..." -ForegroundColor Cyan
-
-try {
-    Get-ScheduledTask |
-        Select-Object @{
-            Name = "任务名称"
-            Expression = { $_.TaskName }
-        }, @{
-            Name = "任务路径"
-            Expression = { $_.TaskPath }
-        }, @{
-            Name = "任务状态"
-            Expression = { $_.State }
-        }, @{
-            Name = "作者"
-            Expression = { $_.Author }
-        }, @{
-            Name = "执行动作"
-            Expression = {
-                ($_.Actions | ForEach-Object {
-                    "$($_.Execute) $($_.Arguments)"
-                }) -join " | "
-            }
-        } |
-        Export-ChineseCsv -Path "$OutputDir\计划任务.csv"
-} catch {
-    Write-Host "[!] 计划任务导出失败。" -ForegroundColor Yellow
-    "计划任务导出失败。" | Out-File "$OutputDir\计划任务_错误.txt" -Encoding UTF8
-}
-
-# ==============================
-# 9. 当前网络连接
-# ==============================
-
-Write-Host "[+] 正在导出当前网络连接..." -ForegroundColor Cyan
-
-try {
-    $NetConnections = Get-NetTCPConnection |
-        ForEach-Object {
-            $Conn = $_
-            $ProcessName = Get-ProcessNameById -ProcessId $Conn.OwningProcess
-
-            [PSCustomObject]@{
-                "本地地址" = $Conn.LocalAddress
-                "本地端口" = $Conn.LocalPort
-                "远程地址" = $Conn.RemoteAddress
-                "远程端口" = $Conn.RemotePort
-                "连接状态" = $Conn.State
-                "进程ID"   = $Conn.OwningProcess
-                "进程名"   = $ProcessName
+    $UserListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
+    if (Test-Path $UserListPath) {
+        $Props = Get-ItemProperty -Path $UserListPath
+        $Props.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } | ForEach-Object {
+            $HiddenAccountResults += [PSCustomObject]@{
+                "检查类型" = "登录界面隐藏账户注册表"
+                "账户名" = $_.Name
+                "数值" = $_.Value
+                "风险说明" = "该账户可能被配置为不在登录界面显示，需要核对是否为攻击者隐藏账户"
             }
         }
+    }
+} catch {}
 
+try {
+    Get-LocalUser | Where-Object { $_.Name -match "\$" -or $_.Description -match "(?i)(hidden|hide|test|admin|backup|system)" } | ForEach-Object {
+        $HiddenAccountResults += [PSCustomObject]@{
+            "检查类型" = "可疑本地账户命名"
+            "账户名" = $_.Name
+            "数值" = "Enabled=$($_.Enabled)"
+            "风险说明" = "账户名或描述存在可疑特征，需要人工确认"
+        }
+    }
+} catch {}
+$HiddenAccountResults | Export-ChineseCsv -Path "$OutputDir\隐藏账户检查.csv"
+
+Write-Host "[+] 正在导出管理员组成员..." -ForegroundColor Cyan
+try {
+    $AdminGroup = Get-LocalGroup | Where-Object { $_.SID.Value -eq "S-1-5-32-544" -or $_.SID -eq "S-1-5-32-544" }
+    if ($AdminGroup) {
+        Get-LocalGroupMember -Group $AdminGroup.Name | Select-Object @{
+            Name = "成员名称"; Expression = { $_.Name }
+        }, @{
+            Name = "对象类型"; Expression = { $_.ObjectClass }
+        }, @{
+            Name = "来源"; Expression = { $_.PrincipalSource }
+        } | Export-ChineseCsv -Path "$OutputDir\管理员组成员.csv"
+    }
+} catch { "管理员组成员导出失败。" | Out-File "$OutputDir\管理员组成员_错误.txt" -Encoding UTF8 }
+
+Write-Host "[+] 正在导出启动项..." -ForegroundColor Cyan
+try {
+    $StartupItems = Get-CimInstance Win32_StartupCommand | Select-Object @{
+        Name = "启动项名称"; Expression = { $_.Name }
+    }, @{
+        Name = "启动命令"; Expression = { $_.Command }
+    }, @{
+        Name = "启动位置"; Expression = { $_.Location }
+    }, @{
+        Name = "所属用户"; Expression = { $_.User }
+    }
+    $StartupItems | Export-ChineseCsv -Path "$OutputDir\启动项.csv"
+} catch { $StartupItems = @() }
+
+Write-Host "[+] 正在导出计划任务..." -ForegroundColor Cyan
+try {
+    $ScheduledTasks = Get-ScheduledTask | Select-Object @{
+        Name = "任务名称"; Expression = { $_.TaskName }
+    }, @{
+        Name = "任务路径"; Expression = { $_.TaskPath }
+    }, @{
+        Name = "任务状态"; Expression = { $_.State }
+    }, @{
+        Name = "作者"; Expression = { $_.Author }
+    }, @{
+        Name = "执行动作"; Expression = { ($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join " | " }
+    }
+    $ScheduledTasks | Export-ChineseCsv -Path "$OutputDir\计划任务.csv"
+} catch { $ScheduledTasks = @() }
+
+# ==============================
+# 2. 网络连接、进程路径与 Hash
+# ==============================
+
+Write-Host "[+] 正在导出当前网络连接并关联进程路径..." -ForegroundColor Cyan
+try {
+    $NetConnections = Get-NetTCPConnection | ForEach-Object {
+        $Conn = $_
+        $Pid = $Conn.OwningProcess
+        $PName = Get-ProcessNameById -ProcessId $Pid
+        $PPath = Get-ProcessPathById -ProcessId $Pid
+        [PSCustomObject]@{
+            "本地地址" = $Conn.LocalAddress
+            "本地端口" = $Conn.LocalPort
+            "远程地址" = $Conn.RemoteAddress
+            "远程端口" = $Conn.RemotePort
+            "连接状态" = $Conn.State
+            "进程ID" = $Pid
+            "进程名" = $PName
+            "进程路径" = $PPath
+            "进程SHA256" = if ($PPath -and (Test-Path $PPath)) { Get-FileHashSafe -Path $PPath -Algorithm SHA256 } else { "" }
+        }
+    }
     $NetConnections | Export-ChineseCsv -Path "$OutputDir\当前网络连接.csv"
 } catch {
     Write-Host "[!] 当前网络连接导出失败。" -ForegroundColor Yellow
-    "当前网络连接导出失败。" | Out-File "$OutputDir\当前网络连接_错误.txt" -Encoding UTF8
     $NetConnections = @()
 }
 
 # ==============================
-# 10. 危险端口初筛降噪
+# 3. Web 目录可疑文件扫描
 # ==============================
 
-Write-Host "[+] 正在进行危险端口初筛降噪..." -ForegroundColor Cyan
+Write-Host "[+] 正在识别 Web 目录..." -ForegroundColor Cyan
+$ResolvedWebRoots = Resolve-WebRoots -UserRoots $WebRoots
+$ResolvedWebRoots | ForEach-Object { [PSCustomObject]@{ "Web目录" = $_ } } | Export-ChineseCsv -Path "$OutputDir\识别到的Web目录.csv"
 
-$DangerPorts = @{
-    21    = @{ Service = "FTP"; Risk = "高危"; Desc = "文件传输服务，可能存在弱口令或明文传输风险"; Outbound = $true }
-    22    = @{ Service = "SSH"; Risk = "中危"; Desc = "远程管理服务，需确认是否允许外部访问"; Outbound = $true }
-    23    = @{ Service = "Telnet"; Risk = "高危"; Desc = "明文远程登录服务，风险较高"; Outbound = $true }
-    25    = @{ Service = "SMTP"; Risk = "中危"; Desc = "邮件服务端口，需确认是否为正常业务"; Outbound = $false }
-    53    = @{ Service = "DNS"; Risk = "中危"; Desc = "域名解析服务，需确认是否为正常业务"; Outbound = $false }
-    80    = @{ Service = "HTTP"; Risk = "中危"; Desc = "Web 服务端口，需确认是否为正常业务"; Outbound = $false }
-    110   = @{ Service = "POP3"; Risk = "中危"; Desc = "邮件接收服务，可能存在明文认证风险"; Outbound = $false }
-    135   = @{ Service = "RPC"; Risk = "高危"; Desc = "Windows RPC 服务，暴露到公网风险较高"; Outbound = $true }
-    139   = @{ Service = "NetBIOS"; Risk = "高危"; Desc = "Windows 文件共享相关端口，暴露风险较高"; Outbound = $true }
-    143   = @{ Service = "IMAP"; Risk = "中危"; Desc = "邮件服务端口，需确认是否为正常业务"; Outbound = $false }
-    389   = @{ Service = "LDAP"; Risk = "高危"; Desc = "目录服务端口，域环境中需要重点关注"; Outbound = $true }
-    443   = @{ Service = "HTTPS"; Risk = "中危"; Desc = "Web 加密服务端口，需确认是否为正常业务"; Outbound = $false }
-    445   = @{ Service = "SMB"; Risk = "高危"; Desc = "Windows 文件共享端口，常被用于横向移动和漏洞利用"; Outbound = $true }
-    1433  = @{ Service = "MSSQL"; Risk = "高危"; Desc = "SQL Server 数据库端口，需排查弱口令和公网暴露"; Outbound = $true }
-    1521  = @{ Service = "Oracle"; Risk = "高危"; Desc = "Oracle 数据库端口，需确认访问来源"; Outbound = $true }
-    3306  = @{ Service = "MySQL"; Risk = "高危"; Desc = "MySQL 数据库端口，需排查弱口令和公网暴露"; Outbound = $true }
-    3389  = @{ Service = "RDP"; Risk = "高危"; Desc = "远程桌面端口，常见爆破目标"; Outbound = $true }
-    5432  = @{ Service = "PostgreSQL"; Risk = "高危"; Desc = "PostgreSQL 数据库端口，需排查弱口令和公网暴露"; Outbound = $true }
-    5900  = @{ Service = "VNC"; Risk = "高危"; Desc = "远程控制服务端口，需确认是否授权"; Outbound = $true }
-    6379  = @{ Service = "Redis"; Risk = "高危"; Desc = "Redis 服务端口，公网暴露风险极高"; Outbound = $true }
-    8080  = @{ Service = "HTTP-Proxy/Tomcat"; Risk = "中危"; Desc = "常见 Web 或代理端口，需确认是否为正常业务"; Outbound = $false }
-    9200  = @{ Service = "Elasticsearch"; Risk = "高危"; Desc = "Elasticsearch 服务端口，未授权访问风险较高"; Outbound = $true }
-    11211 = @{ Service = "Memcached"; Risk = "高危"; Desc = "Memcached 服务端口，公网暴露风险较高"; Outbound = $true }
-    27017 = @{ Service = "MongoDB"; Risk = "高危"; Desc = "MongoDB 数据库端口，需排查未授权访问"; Outbound = $true }
-}
+$SuspiciousWebFiles = @()
+$RecentWebFiles = @()
+$ShellParamCandidates = @()
+$MiningIocResults = @()
+$WebFileCount = 0
 
-$AllDangerPortRecords = @()
-$HighRiskListeningPorts = @()
-$SuspiciousOutboundConnections = @()
+$WebExtensions = @(".php", ".phtml", ".asp", ".aspx", ".ashx", ".asa", ".cer", ".cdx", ".jsp", ".jspx", ".js", ".config", ".txt", ".ini", ".conf")
+$RecentThreshold = (Get-Date).AddDays(-$Days)
 
-foreach ($Conn in $NetConnections) {
-    $LocalPort = 0
-    $RemotePort = 0
+foreach ($Root in $ResolvedWebRoots) {
+    Write-Host "[+] 扫描 Web 目录：$Root" -ForegroundColor Cyan
+    try {
+        $Files = Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+            $WebExtensions -contains $_.Extension.ToLower() -and ($_.Length -le ($MaxFileMB * 1MB))
+        } | Select-Object -First $MaxScanFiles
 
-    [int]::TryParse([string]$Conn."本地端口", [ref]$LocalPort) | Out-Null
-    [int]::TryParse([string]$Conn."远程端口", [ref]$RemotePort) | Out-Null
+        foreach ($File in $Files) {
+            $WebFileCount++
 
-    # 本地危险端口命中
-    if ($DangerPorts.ContainsKey($LocalPort)) {
-        $Info = $DangerPorts[$LocalPort]
-        $IsListening = ([string]$Conn."连接状态" -eq "Listen")
+            if ($File.LastWriteTime -ge $RecentThreshold) {
+                $RecentWebFiles += [PSCustomObject]@{
+                    "文件路径" = $File.FullName
+                    "文件大小" = $File.Length
+                    "最后修改时间" = $File.LastWriteTime
+                    "SHA256" = Get-FileHashSafe -Path $File.FullName -Algorithm SHA256
+                    "说明" = "最近 $Days 天内修改的 Web 目录文件"
+                }
+            }
 
-        $Record = [PSCustomObject]@{
-            "分类" = if ($IsListening) { "本地危险端口监听" } else { "本地危险端口连接" }
-            "检测位置" = "本地端口"
-            "端口" = $LocalPort
-            "服务" = $Info.Service
-            "风险等级" = $Info.Risk
-            "风险说明" = $Info.Desc
-            "本地地址" = $Conn."本地地址"
-            "本地端口" = $Conn."本地端口"
-            "远程地址" = $Conn."远程地址"
-            "远程端口" = $Conn."远程端口"
-            "连接状态" = $Conn."连接状态"
-            "进程ID" = $Conn."进程ID"
-            "进程名" = $Conn."进程名"
-            "安全建议" = if ($IsListening) { "该端口处于监听状态，建议确认是否业务必需；如无必要，应关闭服务或通过防火墙限制访问来源。" } else { "该连接命中本地高风险端口，建议结合远程地址和进程信息进一步判断。" }
+            $Lines = Get-TextPreviewLines -Path $File.FullName -MaxLines 800
+            $LineNo = 0
+            foreach ($Line in $Lines) {
+                $LineNo++
+                if (Test-SuspiciousWebLine -Line $Line) {
+                    $SuspiciousWebFiles += [PSCustomObject]@{
+                        "文件路径" = $File.FullName
+                        "文件大小" = $File.Length
+                        "最后修改时间" = $File.LastWriteTime
+                        "命中行号" = $LineNo
+                        "命中内容" = ($Line.Trim() -replace "\s+", " ")
+                        "SHA256" = Get-FileHashSafe -Path $File.FullName -Algorithm SHA256
+                        "风险说明" = "命中 WebShell 或命令执行相关关键字，需要人工确认"
+                    }
+                }
+
+                $Params = Extract-ShellParamCandidates -Line $Line
+                foreach ($Param in $Params) {
+                    $ShellParamCandidates += [PSCustomObject]@{
+                        "文件路径" = $File.FullName
+                        "最后修改时间" = $File.LastWriteTime
+                        "疑似连接参数或密码字段" = $Param
+                        "命中行号" = $LineNo
+                        "命中内容" = ($Line.Trim() -replace "\s+", " ")
+                        "SHA256" = Get-FileHashSafe -Path $File.FullName -Algorithm SHA256
+                        "说明" = "该字段可能是 WebShell 连接参数或密码字段，需结合文件逻辑确认"
+                    }
+                }
+
+                if (Test-MiningLine -Line $Line) {
+                    $Domains = Extract-DomainsFromText -Text $Line
+                    $MiningIocResults += [PSCustomObject]@{
+                        "来源" = "Web文件"
+                        "文件或对象" = $File.FullName
+                        "命中内容" = ($Line.Trim() -replace "\s+", " ")
+                        "提取域名" = ($Domains -join ";")
+                        "说明" = "命中挖矿相关关键词，需要结合进程、计划任务、网络连接确认"
+                    }
+                }
+            }
         }
-
-        $AllDangerPortRecords += $Record
-
-        if ($IsListening) {
-            $HighRiskListeningPorts += $Record
-        }
-    }
-
-    # 远程危险端口命中：降噪逻辑，只重点记录高风险远程服务端口，排除普通 80/443/DNS 等高频正常连接
-    if ($RemotePort -ne 0 -and $DangerPorts.ContainsKey($RemotePort)) {
-        $Info = $DangerPorts[$RemotePort]
-        $IsPublicRemote = Test-PublicRemoteAddress -Address ([string]$Conn."远程地址")
-        $IsEstablishedOrConnecting = ([string]$Conn."连接状态" -in @("Established", "SynSent", "SynReceived"))
-
-        $Record = [PSCustomObject]@{
-            "分类" = "远程危险端口连接"
-            "检测位置" = "远程端口"
-            "端口" = $RemotePort
-            "服务" = $Info.Service
-            "风险等级" = $Info.Risk
-            "风险说明" = $Info.Desc
-            "本地地址" = $Conn."本地地址"
-            "本地端口" = $Conn."本地端口"
-            "远程地址" = $Conn."远程地址"
-            "远程端口" = $Conn."远程端口"
-            "连接状态" = $Conn."连接状态"
-            "进程ID" = $Conn."进程ID"
-            "进程名" = $Conn."进程名"
-            "安全建议" = "本机正在连接远程高风险服务端口，建议确认是否为正常业务连接，排查异常外联、远程控制或数据库连接行为。"
-        }
-
-        $AllDangerPortRecords += $Record
-
-        if ($Info.Outbound -eq $true -and $IsPublicRemote -and $IsEstablishedOrConnecting) {
-            $SuspiciousOutboundConnections += $Record
-        }
-    }
+    } catch {}
 }
 
-if (@($AllDangerPortRecords).Count -gt 0) {
-    $AllDangerPortRecords |
-        Sort-Object "风险等级", "端口" |
-        Export-ChineseCsv -Path "$OutputDir\全部危险端口记录.csv"
-} else {
-    [PSCustomObject]@{
-        "提示" = "未发现危险端口连接或监听"
-    } | Export-ChineseCsv -Path "$OutputDir\全部危险端口记录.csv"
-}
-
-if (@($HighRiskListeningPorts).Count -gt 0) {
-    $HighRiskListeningPorts |
-        Sort-Object "风险等级", "端口" |
-        Export-ChineseCsv -Path "$OutputDir\高危端口监听.csv"
-    Write-Host "[!] 发现高危端口监听：$(@($HighRiskListeningPorts).Count) 条" -ForegroundColor Red
-} else {
-    [PSCustomObject]@{
-        "提示" = "未发现高危端口监听"
-    } | Export-ChineseCsv -Path "$OutputDir\高危端口监听.csv"
-    Write-Host "[+] 未发现高危端口监听。" -ForegroundColor Green
-}
-
-if (@($SuspiciousOutboundConnections).Count -gt 0) {
-    $SuspiciousOutboundConnections |
-        Sort-Object "风险等级", "端口" |
-        Export-ChineseCsv -Path "$OutputDir\可疑外联连接.csv"
-    Write-Host "[!] 发现可疑外联连接：$(@($SuspiciousOutboundConnections).Count) 条" -ForegroundColor Red
-} else {
-    [PSCustomObject]@{
-        "提示" = "未发现可疑外联连接"
-        "说明" = "当前降噪规则主要关注连接公网高风险服务端口的 Established / SynSent / SynReceived 连接"
-    } | Export-ChineseCsv -Path "$OutputDir\可疑外联连接.csv"
-    Write-Host "[+] 未发现可疑外联连接。" -ForegroundColor Green
-}
-
-# 兼容 v0.1 文件名，方便博客或旧习惯查看
-$AllDangerPortRecords | Export-ChineseCsv -Path "$OutputDir\危险端口警报.csv"
+$RecentWebFiles | Sort-Object "最后修改时间" -Descending | Export-ChineseCsv -Path "$OutputDir\Web目录最近修改文件.csv"
+$SuspiciousWebFiles | Sort-Object "最后修改时间" -Descending | Export-ChineseCsv -Path "$OutputDir\疑似WebShell文件.csv"
+$ShellParamCandidates | Sort-Object "最后修改时间" -Descending | Export-ChineseCsv -Path "$OutputDir\疑似Shell密码或连接参数.csv"
 
 # ==============================
-# 11. 生成重点关注项
+# 4. Web 日志分析与攻击 IP 统计
+# ==============================
+
+Write-Host "[+] 正在识别 Web 日志目录..." -ForegroundColor Cyan
+$ResolvedLogDirs = Resolve-WebLogDirs -UserLogDirs $WebLogDirs
+$ResolvedLogDirs | ForEach-Object { [PSCustomObject]@{ "日志目录" = $_ } } | Export-ChineseCsv -Path "$OutputDir\识别到的Web日志目录.csv"
+
+$WebLogIpRecords = @()
+$SuspiciousWebRequests = @()
+$WebShellAccessRecords = @()
+$WebShellNames = @($SuspiciousWebFiles | ForEach-Object { Split-Path $_."文件路径" -Leaf } | Select-Object -Unique)
+
+$LogExtensions = @(".log", ".txt")
+$SuspiciousRequestPattern = "(?i)(upload|shell|cmd|eval|assert|base64|system|passthru|powershell|certutil|wget|curl|\.php\?|\.asp\?|\.aspx\?|\.jsp\?|select.+from|union.+select|\.\./|%2e%2e|%00)"
+
+foreach ($LogDir in $ResolvedLogDirs) {
+    Write-Host "[+] 分析 Web 日志目录：$LogDir" -ForegroundColor Cyan
+    try {
+        $LogFiles = Get-ChildItem -Path $LogDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+            $LogExtensions -contains $_.Extension.ToLower() -and $_.Length -le 200MB
+        } | Select-Object -First 300
+
+        foreach ($LogFile in $LogFiles) {
+            $Fields = @()
+            $LineNo = 0
+            foreach ($Line in (Get-Content -Path $LogFile.FullName -ErrorAction SilentlyContinue)) {
+                $LineNo++
+                if ([string]::IsNullOrWhiteSpace($Line)) { continue }
+
+                if ($Line.StartsWith("#Fields:")) {
+                    $Fields = ($Line.Replace("#Fields:", "").Trim() -split "\s+")
+                    continue
+                }
+                if ($Line.StartsWith("#")) { continue }
+
+                $ClientIp = ""
+                $Method = ""
+                $UriStem = ""
+                $UriQuery = ""
+                $Status = ""
+                $UserAgent = ""
+
+                if ($Fields.Count -gt 0) {
+                    $Parts = $Line -split "\s+"
+                    for ($i = 0; $i -lt [Math]::Min($Fields.Count, $Parts.Count); $i++) {
+                        switch ($Fields[$i]) {
+                            "c-ip" { $ClientIp = $Parts[$i] }
+                            "cs-method" { $Method = $Parts[$i] }
+                            "cs-uri-stem" { $UriStem = $Parts[$i] }
+                            "cs-uri-query" { $UriQuery = $Parts[$i] }
+                            "sc-status" { $Status = $Parts[$i] }
+                            "cs(User-Agent)" { $UserAgent = $Parts[$i] }
+                        }
+                    }
+                } else {
+                    $IpMatch = [regex]::Match($Line, "(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+                    if ($IpMatch.Success) { $ClientIp = $IpMatch.Value }
+                    $ReqMatch = [regex]::Match($Line, '"(GET|POST|PUT|DELETE|HEAD) +([^ ]+)')
+                    if ($ReqMatch.Success) {
+                        $Method = $ReqMatch.Groups[1].Value
+                        $UriStem = $ReqMatch.Groups[2].Value
+                    }
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($ClientIp)) {
+                    $WebLogIpRecords += [PSCustomObject]@{
+                        "来源IP" = $ClientIp
+                        "方法" = $Method
+                        "路径" = $UriStem
+                        "参数" = $UriQuery
+                        "状态码" = $Status
+                        "日志文件" = $LogFile.FullName
+                        "行号" = $LineNo
+                    }
+                }
+
+                $Combined = "$UriStem $UriQuery $Line"
+                if ($Combined -match $SuspiciousRequestPattern) {
+                    $SuspiciousWebRequests += [PSCustomObject]@{
+                        "来源IP" = $ClientIp
+                        "方法" = $Method
+                        "路径" = $UriStem
+                        "参数" = $UriQuery
+                        "状态码" = $Status
+                        "日志文件" = $LogFile.FullName
+                        "行号" = $LineNo
+                        "原始日志" = ($Line.Trim() -replace "\s+", " ")
+                        "风险说明" = "命中可疑 Web 请求关键字，需要结合上传文件和 WebShell 文件确认"
+                    }
+                }
+
+                foreach ($Name in $WebShellNames) {
+                    if ($Name -and $Combined -match [regex]::Escape($Name)) {
+                        $WebShellAccessRecords += [PSCustomObject]@{
+                            "来源IP" = $ClientIp
+                            "疑似WebShell文件名" = $Name
+                            "方法" = $Method
+                            "路径" = $UriStem
+                            "参数" = $UriQuery
+                            "状态码" = $Status
+                            "日志文件" = $LogFile.FullName
+                            "行号" = $LineNo
+                            "原始日志" = ($Line.Trim() -replace "\s+", " ")
+                            "说明" = "访问日志中出现疑似 WebShell 文件名，可用于辅助锁定攻击 IP"
+                        }
+                    }
+                }
+            }
+        }
+    } catch {}
+}
+
+$WebIpStats = $WebLogIpRecords | Group-Object "来源IP" | ForEach-Object {
+    [PSCustomObject]@{
+        "来源IP" = $_.Name
+        "请求次数" = $_.Count
+        "首次命中文件" = ($_.Group | Select-Object -First 1)."日志文件"
+        "样例路径" = ($_.Group | Select-Object -First 1)."路径"
+    }
+} | Sort-Object "请求次数" -Descending
+
+$WebIpStats | Export-ChineseCsv -Path "$OutputDir\Web访问IP统计.csv"
+$SuspiciousWebRequests | Export-ChineseCsv -Path "$OutputDir\Web可疑请求.csv"
+$WebShellAccessRecords | Export-ChineseCsv -Path "$OutputDir\WebShell访问记录.csv"
+
+# ==============================
+# 5. 挖矿 IOC 提取：进程、计划任务、启动项、Web 文件
+# ==============================
+
+Write-Host "[+] 正在提取挖矿 IOC..." -ForegroundColor Cyan
+
+try {
+    Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "(?i)(xmrig|monero|xmr|stratum|pool|mining|miner|wallet|cryptonight|nicehash|nanopool|supportxmr)" } | ForEach-Object {
+        $Domains = Extract-DomainsFromText -Text $_.CommandLine
+        $MiningIocResults += [PSCustomObject]@{
+            "来源" = "进程命令行"
+            "文件或对象" = "$($_.ProcessId) / $($_.Name) / $($_.ExecutablePath)"
+            "命中内容" = $_.CommandLine
+            "提取域名" = ($Domains -join ";")
+            "说明" = "进程命令行命中挖矿关键词"
+        }
+    }
+} catch {}
+
+foreach ($Item in $StartupItems) {
+    $Text = "$($Item."启动项名称") $($Item."启动命令")"
+    if (Test-MiningLine -Line $Text) {
+        $MiningIocResults += [PSCustomObject]@{
+            "来源" = "启动项"
+            "文件或对象" = $Item."启动项名称"
+            "命中内容" = $Item."启动命令"
+            "提取域名" = ((Extract-DomainsFromText -Text $Text) -join ";")
+            "说明" = "启动项命中挖矿关键词"
+        }
+    }
+}
+
+foreach ($Item in $ScheduledTasks) {
+    $Text = "$($Item."任务名称") $($Item."执行动作")"
+    if (Test-MiningLine -Line $Text) {
+        $MiningIocResults += [PSCustomObject]@{
+            "来源" = "计划任务"
+            "文件或对象" = $Item."任务名称"
+            "命中内容" = $Item."执行动作"
+            "提取域名" = ((Extract-DomainsFromText -Text $Text) -join ";")
+            "说明" = "计划任务命中挖矿关键词"
+        }
+    }
+}
+
+$MiningIocResults | Export-ChineseCsv -Path "$OutputDir\挖矿IOC提取.csv"
+
+# ==============================
+# 6. 重点关注项汇总
 # ==============================
 
 Write-Host "[+] 正在生成重点关注项..." -ForegroundColor Cyan
-
 $FocusItems = @()
 
 foreach ($Item in $HighRiskIps) {
     $FocusItems += [PSCustomObject]@{
-        "类型" = "高危IP"
-        "风险等级" = $Item."风险等级"
+        "类型" = "高危登录IP"
         "对象" = $Item."来源IP"
         "原因" = $Item."风险原因"
-        "建议" = "结合用户名、登录时间、登录类型进一步确认是否为爆破或异常登录"
+        "建议" = "结合 4624/4625 登录时间、用户名、登录类型进一步判断"
     }
 }
 
-foreach ($Item in $HighRiskListeningPorts) {
+foreach ($Item in $HiddenAccountResults) {
     $FocusItems += [PSCustomObject]@{
-        "类型" = "高危端口监听"
-        "风险等级" = $Item."风险等级"
-        "对象" = "$($Item."服务")/$($Item."端口")"
+        "类型" = "隐藏或可疑账户"
+        "对象" = $Item."账户名"
         "原因" = $Item."风险说明"
-        "建议" = $Item."安全建议"
+        "建议" = "核对账户创建时间、权限、登录记录和管理员组成员"
     }
 }
 
-foreach ($Item in $SuspiciousOutboundConnections) {
+foreach ($Item in ($SuspiciousWebFiles | Select-Object -First 50)) {
     $FocusItems += [PSCustomObject]@{
-        "类型" = "可疑外联"
-        "风险等级" = $Item."风险等级"
-        "对象" = "$($Item."远程地址"):$($Item."远程端口")"
+        "类型" = "疑似WebShell文件"
+        "对象" = $Item."文件路径"
         "原因" = $Item."风险说明"
-        "建议" = $Item."安全建议"
+        "建议" = "查看命中内容、最后修改时间、访问日志和文件 Hash"
     }
 }
 
-if (@($FocusItems).Count -gt 0) {
-    $FocusItems | Export-ChineseCsv -Path "$OutputDir\重点关注项.csv"
-} else {
-    [PSCustomObject]@{
-        "提示" = "暂未发现需要重点关注的高危 IP、端口监听或可疑外联"
-    } | Export-ChineseCsv -Path "$OutputDir\重点关注项.csv"
+foreach ($Item in ($ShellParamCandidates | Select-Object -First 50)) {
+    $FocusItems += [PSCustomObject]@{
+        "类型" = "疑似Shell连接参数"
+        "对象" = "$($Item."疑似连接参数或密码字段") / $($Item."文件路径")"
+        "原因" = "Web 文件中出现可能作为 WebShell 连接参数或密码字段的内容"
+        "建议" = "结合 WebShell 文件逻辑确认真实 shell 密码或连接参数"
+    }
 }
+
+foreach ($Item in ($WebShellAccessRecords | Select-Object -First 50)) {
+    $FocusItems += [PSCustomObject]@{
+        "类型" = "WebShell访问记录"
+        "对象" = "$($Item."来源IP") -> $($Item."疑似WebShell文件名")"
+        "原因" = "访问日志中出现疑似 WebShell 文件名"
+        "建议" = "优先核对该 IP 是否为攻击者 IP"
+    }
+}
+
+foreach ($Item in ($MiningIocResults | Select-Object -First 50)) {
+    $FocusItems += [PSCustomObject]@{
+        "类型" = "挖矿IOC"
+        "对象" = $Item."提取域名"
+        "原因" = $Item."说明"
+        "建议" = "结合进程、计划任务、启动项和网络连接确认矿池域名"
+    }
+}
+
+$FocusItems | Export-ChineseCsv -Path "$OutputDir\重点关注项.csv"
 
 # ==============================
-# 12. 生成采集摘要
+# 7. 生成摘要
 # ==============================
-
-$SuccessCountTotal = @($SuccessLogons).Count
-$FailedCountTotal = @($FailedLogons).Count
-$IpCountTotal = @($IpStats).Count
-$HighRiskIpCount = @($HighRiskIps).Count
-$AllDangerPortCount = @($AllDangerPortRecords).Count
-$HighRiskListeningCount = @($HighRiskListeningPorts).Count
-$SuspiciousOutboundCount = @($SuspiciousOutboundConnections).Count
-$FocusItemCount = @($FocusItems).Count
 
 $Summary = @"
 WinIR-Helper $Version 应急响应采集摘要
 
 采集时间：$(Get-Date)
-日志范围：最近 $Days 天
-高危 IP 判断阈值：单个 IP 登录失败次数 >= $FailedThreshold
+日志范围：$($Range.Start) 到 $($Range.End)
 管理员权限：$IsAdmin
 
-一、登录日志统计
-4624 登录成功日志数量：$SuccessCountTotal
-4625 登录失败日志数量：$FailedCountTotal
+一、基础日志
+登录成功日志数量：$(@($SuccessLogons).Count)
+登录失败日志数量：$(@($FailedLogons).Count)
+高危登录 IP 数量：$(@($HighRiskIps).Count)
 
-二、来源 IP 统计
-来源 IP 数量：$IpCountTotal
-高危 IP 数量：$HighRiskIpCount
+二、账户检查
+隐藏或可疑账户数量：$(@($HiddenAccountResults).Count)
 
-三、危险端口初筛降噪
-全部危险端口记录数量：$AllDangerPortCount
-高危端口监听数量：$HighRiskListeningCount
-可疑外联连接数量：$SuspiciousOutboundCount
+三、Web 应急模块
+识别到的 Web 目录数量：$(@($ResolvedWebRoots).Count)
+扫描 Web 文件数量：$WebFileCount
+最近修改 Web 文件数量：$(@($RecentWebFiles).Count)
+疑似 WebShell 文件数量：$(@($SuspiciousWebFiles).Count)
+疑似 Shell 密码或连接参数数量：$(@($ShellParamCandidates).Count)
 
-四、重点关注项
-重点关注项数量：$FocusItemCount
+四、Web 日志分析
+识别到的 Web 日志目录数量：$(@($ResolvedLogDirs).Count)
+Web 访问 IP 数量：$(@($WebIpStats).Count)
+Web 可疑请求数量：$(@($SuspiciousWebRequests).Count)
+WebShell 访问记录数量：$(@($WebShellAccessRecords).Count)
 
-五、v0.2 更新说明
-1. 增强管理员权限检测：默认非管理员权限下主动退出，避免 Security 日志读取失败后生成误导性结果。
-2. 优化危险端口初筛：将原本混合输出的危险端口记录拆分为全部危险端口记录、高危端口监听和可疑外联连接。
-3. 增加重点关注项：汇总高危 IP、高危端口监听和可疑外联连接，方便优先排查。
+五、挖矿 IOC
+挖矿 IOC 数量：$(@($MiningIocResults).Count)
 
-六、输出文件说明
-1. 4624_登录成功日志.csv：Windows 登录成功日志
-2. 4625_登录失败日志.csv：Windows 登录失败日志
-3. 来源IP统计.csv：统计每个来源 IP 的成功和失败次数
-4. 高危IP筛选.csv：自动筛选疑似爆破或异常登录 IP
-5. 本地用户.csv：当前主机本地用户
-6. 管理员组成员.csv：本地管理员组成员
-7. 启动项.csv：系统启动项
-8. 计划任务.csv：系统计划任务
-9. 当前网络连接.csv：当前 TCP 网络连接
-10. 全部危险端口记录.csv：所有命中危险端口规则的连接或监听记录
-11. 高危端口监听.csv：处于 Listen 状态的本地危险端口
-12. 可疑外联连接.csv：连接公网高风险服务端口的可疑外联记录
-13. 危险端口警报.csv：兼容 v0.1 的危险端口记录文件
-14. 重点关注项.csv：优先排查对象汇总
-15. 采集摘要.txt：本次采集摘要
+六、重点关注项
+重点关注项数量：$(@($FocusItems).Count)
 
-七、注意
-该工具只做自动化初筛，不能直接作为最终研判结论。
-高危 IP、危险端口和可疑外联需要结合实际业务、登录时间、用户名、进程路径、资产用途进一步判断。
+七、建议优先查看文件
+1. 重点关注项.csv
+2. 疑似WebShell文件.csv
+3. 疑似Shell密码或连接参数.csv
+4. WebShell访问记录.csv
+5. Web访问IP统计.csv
+6. Web可疑请求.csv
+7. 隐藏账户检查.csv
+8. 挖矿IOC提取.csv
+
+八、说明
+本工具只能做自动化辅助筛查，不能保证直接命中全部入侵答案。
+对于 Web1 这类 Web 应急题，建议结合 WebShell 文件、Web 日志、隐藏账户和挖矿 IOC 进行人工复核。
 "@
 
 $Summary | Out-File "$OutputDir\采集摘要.txt" -Encoding UTF8
@@ -757,12 +890,14 @@ $Summary | Out-File "$OutputDir\采集摘要.txt" -Encoding UTF8
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Green
 Write-Host "[+] 信息采集完成！" -ForegroundColor Green
-Write-Host "[+] 登录成功日志数量：$SuccessCountTotal" -ForegroundColor Green
-Write-Host "[+] 登录失败日志数量：$FailedCountTotal" -ForegroundColor Green
-Write-Host "[+] 高危 IP 数量：$HighRiskIpCount" -ForegroundColor Green
-Write-Host "[+] 全部危险端口记录数量：$AllDangerPortCount" -ForegroundColor Green
-Write-Host "[+] 高危端口监听数量：$HighRiskListeningCount" -ForegroundColor Green
-Write-Host "[+] 可疑外联连接数量：$SuspiciousOutboundCount" -ForegroundColor Green
-Write-Host "[+] 重点关注项数量：$FocusItemCount" -ForegroundColor Green
+Write-Host "[+] 登录成功日志数量：$(@($SuccessLogons).Count)" -ForegroundColor Green
+Write-Host "[+] 登录失败日志数量：$(@($FailedLogons).Count)" -ForegroundColor Green
+Write-Host "[+] 隐藏或可疑账户数量：$(@($HiddenAccountResults).Count)" -ForegroundColor Green
+Write-Host "[+] 疑似 WebShell 文件数量：$(@($SuspiciousWebFiles).Count)" -ForegroundColor Green
+Write-Host "[+] 疑似 Shell 密码或连接参数数量：$(@($ShellParamCandidates).Count)" -ForegroundColor Green
+Write-Host "[+] Web 可疑请求数量：$(@($SuspiciousWebRequests).Count)" -ForegroundColor Green
+Write-Host "[+] WebShell 访问记录数量：$(@($WebShellAccessRecords).Count)" -ForegroundColor Green
+Write-Host "[+] 挖矿 IOC 数量：$(@($MiningIocResults).Count)" -ForegroundColor Green
+Write-Host "[+] 重点关注项数量：$(@($FocusItems).Count)" -ForegroundColor Green
 Write-Host "[+] 结果目录：$OutputDir" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Green
