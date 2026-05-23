@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    v0.5.0-beta - Windows 应急响应场景聚合分析脚本
+    v0.5.2-beta - Windows 应急响应场景聚合分析脚本（挖矿配置追踪增强 + 离线 Hash 计算器）
 
 .DESCRIPTION
     v0.5-scenario 重点修复之前版本的几个问题：
@@ -11,6 +11,9 @@
     5. 新增 RDP 相关事件 1149 / 21 / 24 / 25 关联分析。
     6. 新增危险监听端口聚合扫描，重点关注 3389 / 445 / 5985 / 5986。
     7. 新增可疑启动项检查，重点识别 AppData / Public / Temp 下的 bat、ps1、vbs、exe 持久化。
+    8. HTML 报告内置离线文件 Hash 计算器，可在浏览器本地选择文件计算 SHA-1/SHA-256/SHA-384/SHA-512，并输出大写/小写 Hash。
+    9. 新增挖矿配置追踪增强：资源异常、服务、计划任务、启动项命中的可疑目录会自动进入矿池/钱包配置扫描队列。
+    10. 保留 PowerShell 独立 Hash 计算模式，支持单文件、多文件、目录递归和大小写 Hash 输出。
 
 .NOTES
     本工具只做蓝队应急响应辅助取证与线索整理，不做查杀，不替代 D盾、河马、EDR、杀毒软件等专业工具。
@@ -40,10 +43,22 @@ param(
 
     [double]$MemoryHighMB = 1024,
 
-    [double]$MemoryHighPercent = 25
+    [double]$MemoryHighPercent = 25,
+
+    # 文件 Hash 独立计算模式：支持单文件/多文件/目录，输出大小写 Hash
+    [string[]]$HashFile = @(),
+
+    [string]$HashFolder = "",
+
+    [switch]$HashRecurse,
+
+    [switch]$HashOnly,
+
+    [ValidateSet("MD5","SHA1","SHA256","SHA384","SHA512")]
+    [string[]]$HashAlgorithm = @("MD5","SHA1","SHA256")
 )
 
-$Version = "v0.5.0-beta"
+$Version = "v0.5.2-beta"
 $ScriptName = "WinIR-Helper.ps1"
 
 # =========================================================
@@ -74,6 +89,7 @@ function HtmlEncode {
     if ($null -eq $Value) { return "" }
     return [System.Net.WebUtility]::HtmlEncode([string]$Value)
 }
+
 
 function Add-Finding {
     param(
@@ -708,6 +724,15 @@ function Test-IsSuspiciousPersistencePath {
 }
 
 # =========================================================
+# 独立文件 Hash 计算模式
+# =========================================================
+
+if ($HashOnly -or $HashFile.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($HashFolder)) {
+    Invoke-HashCalculator
+    return
+}
+
+# =========================================================
 # 初始化
 # =========================================================
 
@@ -1210,10 +1235,15 @@ foreach ($s in $StartupItems) {
     $isTrustedVendor = Test-IsTrustedVendorCommand -Command $s.Command
     $isDangerScriptOrCommand = Test-IsScriptOrDangerPersistence -Command $s.Command
 
-    # 仅位于 AppData 不直接判为可疑；很多正常软件也会放在 AppData。
-    # 只有脚本/危险命令/未知签名/明显可疑路径组合时才进入重点关注。
-    if ((Test-IsSuspiciousPersistencePath -PathOrCommand $s.Command) -and (-not $isTrustedVendor) -and ($isDangerScriptOrCommand -or $s.Signature -ne "Valid")) {
-        $reason += "启动项位于可疑目录且缺少可信特征"
+    $isSuspiciousPath = Test-IsSuspiciousPersistencePath -PathOrCommand $s.Command
+
+    # v0.5.2 调整：持久化启动项只要落在 ProgramData / Public / Temp / Downloads / AppData 等高风险位置，
+    # 即使文件带有效签名也进入关注。真实攻击中常见“复制系统签名程序到可写目录后持久化”的伪装方式。
+    if ($isSuspiciousPath -and (-not $isTrustedVendor)) {
+        $reason += "启动项执行路径位于可疑目录"
+        if ([string]::IsNullOrWhiteSpace($s.Signature) -or $s.Signature -ne "Valid") {
+            $reason += "启动项位于可疑目录且缺少可信签名"
+        }
     }
 
     if ($isDangerScriptOrCommand) {
@@ -1225,7 +1255,7 @@ foreach ($s in $StartupItems) {
     }
 
     if ($reason.Count -gt 0) {
-        $level = if ($s.Command -match "(?i)\.(bat|cmd|ps1|vbs|js|hta)\b|xmrig|miner|c3pool|downloadstring|-enc|-encodedcommand") { "高危" } else { "中危" }
+        $level = if ($s.Command -match "(?i)\.(bat|cmd|ps1|vbs|js|hta)\b|xmrig|miner|c3pool|stratum|monero|downloadstring|-enc|-encodedcommand") { "高危" } else { "中危" }
 
         $obj = [PSCustomObject]@{
             Level     = $level
@@ -1443,29 +1473,80 @@ Write-Info "正在提取挖矿配置文件中的矿池和钱包线索..."
 
 $MiningCandidateDirs = New-Object System.Collections.Generic.List[string]
 
-# 1. 从已经命中的挖矿/持久化线索中提取目录
+# 1. 从已经命中的资源异常/服务/计划任务/启动项中提取目录
+#    v0.5.2 关键改进：不再只信 xmrig/miner 等关键词。
+#    只要进程、服务、计划任务或启动项已经被判为可疑，就将其所在目录加入轻量扫描队列，
+#    再从目录内提取 stratum / pool / wallet / user 等配置证据。
+$MiningCandidateSources = New-Object System.Collections.Generic.List[object]
+
+function Add-MiningCandidateFromEvidence {
+    param(
+        [string]$SourceType,
+        [string]$EvidenceName,
+        [string]$Value,
+        [string]$Reason
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+
+    $beforeCount = $MiningCandidateDirs.Count
+    Add-MiningCandidateDir -List $MiningCandidateDirs -Value $Value
+    $afterCount = $MiningCandidateDirs.Count
+
+    $MiningCandidateSources.Add([PSCustomObject]@{
+        SourceType   = $SourceType
+        EvidenceName = $EvidenceName
+        Value        = $Value
+        Reason       = $Reason
+        AddedDir     = if ($afterCount -gt $beforeCount) { "Yes" } else { "MaybeExistingOrInvalid" }
+    }) | Out-Null
+}
+
 foreach ($r in $ResourceAnomalies) {
-    if ("$($r.Name) $($r.ExecutablePath) $($r.CommandLine) $($r.Tags)" -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") {
-        Add-MiningCandidateDir -List $MiningCandidateDirs -Value $r.ExecutablePath
-        Add-MiningCandidateDir -List $MiningCandidateDirs -Value $r.CommandLine
+    $resourceText = "$($r.Name) $($r.ExecutablePath) $($r.CommandLine) $($r.Tags)"
+    $shouldTrace = $false
+    $traceReason = @()
+
+    if ($resourceText -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") { $shouldTrace = $true; $traceReason += "命中挖矿/驱动/服务特征" }
+    if ($r.Score -ge 4 -and $r.ExecutablePath -match $SuspiciousPathRegex) { $shouldTrace = $true; $traceReason += "资源异常且位于可疑目录" }
+    if ($r.CpuPercent -ge $CpuHighPercent -and $r.ExecutablePath -match $SuspiciousPathRegex) { $shouldTrace = $true; $traceReason += "高 CPU 且位于可疑目录" }
+    if ($r.PublicConnections -ge 1 -and $r.ExecutablePath -match $SuspiciousPathRegex) { $shouldTrace = $true; $traceReason += "可疑目录进程存在公网连接" }
+    if ($r.CommandLine -match "(?i)--config\s+|\s-c\s+|/config\s+|config\.json|\.conf\b") { $shouldTrace = $true; $traceReason += "命令行疑似指定配置文件" }
+
+    if ($shouldTrace) {
+        Add-MiningCandidateFromEvidence -SourceType "资源异常进程" -EvidenceName $r.Name -Value $r.ExecutablePath -Reason ($traceReason -join ";")
+        Add-MiningCandidateFromEvidence -SourceType "资源异常进程命令行" -EvidenceName $r.Name -Value $r.CommandLine -Reason ($traceReason -join ";")
     }
 }
 
 foreach ($s in $ServiceEvents) {
-    if ("$($s.ServiceName) $($s.ImagePath) $($s.Reason)" -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") {
-        Add-MiningCandidateDir -List $MiningCandidateDirs -Value $s.ImagePath
+    if ($s.Level -eq "正常") { continue }
+    $serviceText = "$($s.ServiceName) $($s.ImagePath) $($s.Reason)"
+    $shouldTrace = $false
+    $traceReason = @()
+
+    if ($serviceText -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") { $shouldTrace = $true; $traceReason += "服务命中挖矿/驱动/持久化特征" }
+    if (Test-IsSuspiciousPersistencePath -PathOrCommand $s.ImagePath) { $shouldTrace = $true; $traceReason += "服务路径位于可疑目录" }
+    if ($s.Reason -match "可疑路径|用户目录|临时目录|挖矿|持久化") { $shouldTrace = $true; $traceReason += "服务安装原因可疑" }
+    if ($s.ImagePath -match "(?i)--config\s+|\s-c\s+|/config\s+|config\.json|\.conf\b") { $shouldTrace = $true; $traceReason += "服务命令疑似指定配置文件" }
+
+    if ($shouldTrace) {
+        Add-MiningCandidateFromEvidence -SourceType "服务安装" -EvidenceName $s.ServiceName -Value $s.ImagePath -Reason ($traceReason -join ";")
     }
 }
 
 foreach ($t in $SuspiciousTasks) {
-    if ("$($t.TaskName) $($t.Actions) $($t.Reason)" -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") {
-        Add-MiningCandidateDir -List $MiningCandidateDirs -Value $t.Actions
-    }
+    Add-MiningCandidateFromEvidence -SourceType "可疑计划任务" -EvidenceName $t.TaskName -Value $t.Actions -Reason $t.Reason
 }
 
 foreach ($s in $SuspiciousStartup) {
-    if ("$($s.Name) $($s.Command) $($s.Reason)" -match "(?i)xmrig|miner|c3pool|monero|stratum|WinRing0|nssm") {
-        Add-MiningCandidateDir -List $MiningCandidateDirs -Value $s.Command
+    Add-MiningCandidateFromEvidence -SourceType "可疑启动项" -EvidenceName $s.Name -Value $s.Command -Reason $s.Reason
+}
+
+# 对全部启动项做一次轻量补充：如果持久化命令本身位于可疑目录，但由于签名/厂商规则没有进入重点关注，也加入候选目录池。
+foreach ($s in $StartupItems) {
+    if ((Test-IsSuspiciousPersistencePath -PathOrCommand $s.Command) -and (-not (Test-IsTrustedVendorCommand -Command $s.Command))) {
+        Add-MiningCandidateFromEvidence -SourceType "启动项补充" -EvidenceName $s.Name -Value $s.Command -Reason "启动项命令位于可疑目录，加入配置扫描候选"
     }
 }
 
@@ -1479,6 +1560,13 @@ try {
                     if (-not $MiningCandidateDirs.Contains($_.FullName)) {
                         $MiningCandidateDirs.Add($_.FullName) | Out-Null
                     }
+                    $MiningCandidateSources.Add([PSCustomObject]@{
+                        SourceType   = "常见挖矿目录名"
+                        EvidenceName = $_.Name
+                        Value        = $_.FullName
+                        Reason       = "目录名命中挖矿关键词"
+                        AddedDir     = "Yes"
+                    }) | Out-Null
                 }
             }
         }
@@ -1561,6 +1649,10 @@ foreach ($mc in $MiningConfigs) {
     $MiningConfigsArray += $mc
 }
 
+$MiningCandidateSourcesArray = @()
+foreach ($src in $MiningCandidateSources) { $MiningCandidateSourcesArray += $src }
+
+Export-DetailCsv -Name "挖矿配置扫描目录来源.csv" -Data $MiningCandidateSourcesArray
 Export-DetailCsv -Name "挖矿配置文件候选.csv" -Data $MiningConfigFiles
 Export-DetailCsv -Name "挖矿配置提取.csv" -Data $MiningConfigsArray
 
@@ -1735,6 +1827,7 @@ foreach ($p in ($DangerPorts | Select-Object -First 20)) {
 }
 $summaryLines += ""
 $summaryLines += "五、挖矿配置提取"
+$summaryLines += "配置扫描候选来源数：$($MiningCandidateSourcesArray.Count)，候选文件数：$($MiningConfigFiles.Count)，提取线索数：$($MiningConfigsArray.Count)"
 foreach ($m in ($MiningConfigsArray | Select-Object -First 20)) {
     $summaryLines += "[$($m.Type)] $($m.Value) 来源=$($m.FilePath) 置信度=$($m.Confidence)"
 }
@@ -1758,6 +1851,7 @@ $portForHtml = $DangerPorts | Select-Object Level,LocalPort,LocalAddress,Service
 $resourceForHtml = $ResourceAnomalies | Select-Object Level,Score,ProcessId,Name,CpuPercent,MemoryMB,MemoryPercent,PublicConnections,Tags,ExecutablePath,CommandLine
 $netForHtml = $NetConns | Where-Object { $_.IsPublicIP -eq $true } | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,ProcessId,ProcessName,ProcessPath
 $miningConfigForHtml = $MiningConfigsArray | Select-Object Type,Value,Confidence,FilePath,SourceDir,Context
+$miningCandidateForHtml = $MiningCandidateSourcesArray | Select-Object SourceType,EvidenceName,Value,Reason,AddedDir
 $psForHtml = $PowerShellFindings | Select-Object TimeCreated,EventID,Summary
 
 $ReportPath = Join-Path $OutputDir "WinIR_Report.html"
@@ -1787,8 +1881,250 @@ td { color:#e5e7eb; word-break:break-all; }
 .empty { color:#94a3b8; }
 .footer { color:#94a3b8; margin-top:22px; font-size:13px; }
 code { color:#a7f3d0; }
+.hash-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:12px 0 14px 0; }
+.hash-file { background:#0f172a; border:1px dashed #475569; border-radius:12px; padding:10px; color:#e5e7eb; min-width:280px; }
+.hash-options { display:flex; flex-wrap:wrap; gap:10px; color:#cbd5e1; }
+.hash-options label { background:#0f172a; border:1px solid #334155; border-radius:999px; padding:7px 10px; cursor:pointer; }
+.hash-btn { border:0; border-radius:12px; padding:10px 14px; background:#2563eb; color:white; cursor:pointer; font-weight:700; }
+.hash-btn.secondary { background:#334155; }
+.hash-btn:disabled { opacity:.55; cursor:not-allowed; }
+.hash-note { color:#a7f3d0; background:rgba(20,184,166,.08); border:1px solid rgba(45,212,191,.25); border-radius:12px; padding:10px 12px; }
+.hash-status { color:#bfdbfe; margin:8px 0; }
+.hash-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.hash-actions button { border:1px solid #475569; background:#0f172a; color:#dbeafe; border-radius:10px; padding:6px 8px; cursor:pointer; }
+.hash-small { color:#94a3b8; font-size:12px; }
 </style>
 "@
+
+$hashToolHtml = @'
+    <div class="section" id="offline-hash-tool">
+        <h2>零、离线文件 Hash 计算器</h2>
+        <p class="hash-note">选择本地文件后，Hash 在当前浏览器中离线计算，文件不会上传到服务器，也不会写入报告目录。适合快速计算样本 Hash 后复制到 VirusTotal、微步、EDR 或情报平台中检索。</p>
+
+        <div class="hash-toolbar">
+            <input class="hash-file" id="hashFiles" type="file" multiple />
+            <div class="hash-options" aria-label="Hash 算法选择">
+                <label><input type="checkbox" name="hashAlgo" value="SHA-1" checked /> SHA-1</label>
+                <label><input type="checkbox" name="hashAlgo" value="SHA-256" checked /> SHA-256</label>
+                <label><input type="checkbox" name="hashAlgo" value="SHA-384" /> SHA-384</label>
+                <label><input type="checkbox" name="hashAlgo" value="SHA-512" /> SHA-512</label>
+            </div>
+            <button class="hash-btn" id="hashCalcBtn" type="button">开始计算</button>
+            <button class="hash-btn secondary" id="hashClearBtn" type="button">清空结果</button>
+            <button class="hash-btn secondary" id="hashCsvBtn" type="button" disabled>导出 CSV</button>
+        </div>
+
+        <div class="hash-small">说明：浏览器原生 Web Crypto API 不支持 MD5。应急检索建议优先使用 SHA-256；如确需 MD5，可在 PowerShell 中使用 <code>Get-FileHash -Algorithm MD5</code>。</div>
+        <div class="hash-status" id="hashStatus">尚未选择文件。</div>
+        <div id="hashResultWrap"><p class="empty">计算结果会显示在这里。</p></div>
+    </div>
+
+    <script>
+    (function () {
+        var hashRows = [];
+        var fileInput = document.getElementById('hashFiles');
+        var calcBtn = document.getElementById('hashCalcBtn');
+        var clearBtn = document.getElementById('hashClearBtn');
+        var csvBtn = document.getElementById('hashCsvBtn');
+        var statusBox = document.getElementById('hashStatus');
+        var resultWrap = document.getElementById('hashResultWrap');
+
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function bytesToHex(buffer) {
+            var bytes = new Uint8Array(buffer);
+            var hex = [];
+            for (var i = 0; i < bytes.length; i++) {
+                hex.push(bytes[i].toString(16).padStart(2, '0'));
+            }
+            return hex.join('');
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            var i = Math.floor(Math.log(bytes) / Math.log(1024));
+            if (i < 0) i = 0;
+            if (i >= units.length) i = units.length - 1;
+            return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+        }
+
+        function getSelectedAlgorithms() {
+            var checked = document.querySelectorAll('input[name="hashAlgo"]:checked');
+            var arr = [];
+            for (var i = 0; i < checked.length; i++) arr.push(checked[i].value);
+            return arr;
+        }
+
+        function setBusy(isBusy) {
+            calcBtn.disabled = isBusy;
+            clearBtn.disabled = isBusy;
+            csvBtn.disabled = isBusy || hashRows.length === 0;
+        }
+
+        async function calculateHashes() {
+            if (!window.crypto || !window.crypto.subtle) {
+                statusBox.textContent = '当前浏览器不支持 crypto.subtle。建议使用新版 Edge、Chrome 或 Firefox 打开本报告。';
+                return;
+            }
+
+            var files = fileInput.files;
+            var algorithms = getSelectedAlgorithms();
+
+            if (!files || files.length === 0) {
+                statusBox.textContent = '请先选择一个或多个文件。';
+                return;
+            }
+            if (algorithms.length === 0) {
+                statusBox.textContent = '请至少选择一种 Hash 算法。';
+                return;
+            }
+
+            hashRows = [];
+            resultWrap.innerHTML = '<p class="empty">正在计算，请勿关闭页面。大文件需要更多时间。</p>';
+            setBusy(true);
+
+            try {
+                for (var f = 0; f < files.length; f++) {
+                    var file = files[f];
+                    statusBox.textContent = '正在读取：' + file.name + '（' + (f + 1) + '/' + files.length + '）';
+                    var buffer = await file.arrayBuffer();
+
+                    for (var a = 0; a < algorithms.length; a++) {
+                        var algo = algorithms[a];
+                        statusBox.textContent = '正在计算：' + file.name + ' / ' + algo;
+                        var digest = await crypto.subtle.digest(algo, buffer);
+                        var lower = bytesToHex(digest);
+                        hashRows.push({
+                            fileName: file.name,
+                            fileSizeBytes: file.size,
+                            fileSize: formatBytes(file.size),
+                            lastModified: file.lastModified ? new Date(file.lastModified).toLocaleString() : '',
+                            algorithm: algo,
+                            hashUpper: lower.toUpperCase(),
+                            hashLower: lower.toLowerCase()
+                        });
+                    }
+                }
+                statusBox.textContent = '计算完成：' + files.length + ' 个文件，' + hashRows.length + ' 条 Hash 结果。';
+                renderTable();
+            } catch (err) {
+                statusBox.textContent = '计算失败：' + (err && err.message ? err.message : err);
+                resultWrap.innerHTML = '<p class="empty">计算失败，请更换浏览器或减少单次选择的大文件数量后重试。</p>';
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        function renderTable() {
+            if (hashRows.length === 0) {
+                resultWrap.innerHTML = '<p class="empty">暂无计算结果。</p>';
+                csvBtn.disabled = true;
+                return;
+            }
+
+            var html = '<table><thead><tr>' +
+                '<th>文件名</th><th>大小</th><th>修改时间</th><th>算法</th><th>Hash 大写</th><th>hash 小写</th><th>操作</th>' +
+                '</tr></thead><tbody>';
+
+            for (var i = 0; i < hashRows.length; i++) {
+                var r = hashRows[i];
+                html += '<tr>' +
+                    '<td>' + escapeHtml(r.fileName) + '</td>' +
+                    '<td>' + escapeHtml(r.fileSize) + '</td>' +
+                    '<td>' + escapeHtml(r.lastModified) + '</td>' +
+                    '<td>' + escapeHtml(r.algorithm) + '</td>' +
+                    '<td><code>' + escapeHtml(r.hashUpper) + '</code></td>' +
+                    '<td><code>' + escapeHtml(r.hashLower) + '</code></td>' +
+                    '<td><div class="hash-actions">' +
+                    '<button type="button" data-copy="upper" data-index="' + i + '">复制大写</button>' +
+                    '<button type="button" data-copy="lower" data-index="' + i + '">复制小写</button>' +
+                    '</div></td>' +
+                    '</tr>';
+            }
+
+            html += '</tbody></table>';
+            resultWrap.innerHTML = html;
+            csvBtn.disabled = false;
+        }
+
+        function copyText(text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function () {
+                    statusBox.textContent = '已复制到剪贴板。';
+                }).catch(function () {
+                    fallbackCopy(text);
+                });
+            } else {
+                fallbackCopy(text);
+            }
+        }
+
+        function fallbackCopy(text) {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            try {
+                document.execCommand('copy');
+                statusBox.textContent = '已复制到剪贴板。';
+            } catch (e) {
+                statusBox.textContent = '复制失败，请手动选中 Hash 复制。';
+            }
+            document.body.removeChild(ta);
+        }
+
+        function toCsvCell(value) {
+            return '"' + String(value == null ? '' : value).replace(/"/g, '""') + '"';
+        }
+
+        function exportCsv() {
+            if (hashRows.length === 0) return;
+            var lines = [];
+            lines.push(['FileName', 'FileSizeBytes', 'FileSize', 'LastModified', 'Algorithm', 'HashUpper', 'HashLower'].map(toCsvCell).join(','));
+            for (var i = 0; i < hashRows.length; i++) {
+                var r = hashRows[i];
+                lines.push([r.fileName, r.fileSizeBytes, r.fileSize, r.lastModified, r.algorithm, r.hashUpper, r.hashLower].map(toCsvCell).join(','));
+            }
+            var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'WinIR_Offline_File_Hash.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            statusBox.textContent = 'CSV 已导出。';
+        }
+
+        calcBtn.addEventListener('click', calculateHashes);
+        clearBtn.addEventListener('click', function () {
+            hashRows = [];
+            fileInput.value = '';
+            statusBox.textContent = '已清空结果。';
+            resultWrap.innerHTML = '<p class="empty">计算结果会显示在这里。</p>';
+            csvBtn.disabled = true;
+        });
+        csvBtn.addEventListener('click', exportCsv);
+        resultWrap.addEventListener('click', function (event) {
+            var target = event.target;
+            if (!target || !target.getAttribute) return;
+            var mode = target.getAttribute('data-copy');
+            var index = parseInt(target.getAttribute('data-index'), 10);
+            if (!mode || isNaN(index) || !hashRows[index]) return;
+            copyText(mode === 'upper' ? hashRows[index].hashUpper : hashRows[index].hashLower);
+        });
+    })();
+    </script>
+'@
 
 $html = @"
 <!DOCTYPE html>
@@ -1813,6 +2149,8 @@ $css
         <div class="card"><div class="num watch">$WatchCount</div><div class="label">关注项</div></div>
         <div class="card"><div class="num ok">$($SecurityEvents.Count)</div><div class="label">安全事件数量</div></div>
     </div>
+
+$hashToolHtml
 
     <div class="section">
         <h2>一、攻击场景判断</h2>
@@ -1852,8 +2190,14 @@ $css
 
     <div class="section">
         <h2>八、挖矿配置提取（矿池 / 钱包）</h2>
-        <p class="empty">该模块只扫描已命中的可疑挖矿目录和常见挖矿目录，不做全盘深度扫描，避免过慢和误报。</p>
+        <p class="empty">该模块不做全盘深度扫描。v0.5.2 会把资源异常进程、可疑服务、可疑计划任务、可疑启动项及常见挖矿目录统一汇总为候选目录，再在候选目录中提取矿池、钱包、user、url 等配置线索。</p>
         $(ConvertTo-HtmlTable -Data $miningConfigForHtml -MaxRows 80)
+    </div>
+
+    <div class="section">
+        <h2>八-补充、挖矿配置扫描目录来源</h2>
+        <p class="empty">用于解释为什么某个目录会被继续扫描，便于复核“资源异常 → 目录追踪 → 配置提取”的证据链。</p>
+        $(ConvertTo-HtmlTable -Data $miningCandidateForHtml -MaxRows 80)
     </div>
 
     <div class="section">
