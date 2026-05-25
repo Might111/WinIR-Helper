@@ -67,7 +67,7 @@ param(
     [string[]]$HashAlgorithm = @("MD5","SHA1","SHA256")
 )
 
-$Version = "v0.6.8-beta"
+$Version = "v0.7.1-beta"
 $ScriptName = "WinIR-Helper.ps1"
 
 # =========================================================
@@ -3300,6 +3300,365 @@ Export-DetailCsv -Name "ATTACK技术映射.csv" -Data $AttackTechniques
 Export-DetailCsv -Name "证据链概览.csv" -Data $EvidenceChain
 
 # =========================================================
+# 模块 10：v0.7 证据链评分与处置建议生成器
+# =========================================================
+
+Write-Info "正在生成 v0.7 证据链评分与处置建议..."
+
+function Limit-Score {
+    param([int]$Score)
+    if ($Score -lt 0) { return 0 }
+    if ($Score -gt 100) { return 100 }
+    return $Score
+}
+
+function Get-ScoreLevel {
+    param([int]$Score)
+    if ($Score -ge 80) { return "高危" }
+    elseif ($Score -ge 50) { return "中危" }
+    elseif ($Score -ge 25) { return "关注" }
+    return "低"
+}
+
+function Get-EvidenceIdsByTechnique {
+    param([string[]]$TechniqueIds)
+    $ids = @()
+    foreach ($tid in $TechniqueIds) {
+        $ids += @($AttackTimelineArray | Where-Object { $_.TechniqueId -eq $tid } | Select-Object -ExpandProperty EvidenceId)
+    }
+    return (($ids | Where-Object { $_ } | Sort-Object -Unique) -join ";")
+}
+
+function Add-EvidenceScore {
+    param(
+        [System.Collections.Generic.List[object]]$List,
+        [string]$Scenario,
+        [int]$Score,
+        [string]$Conclusion,
+        [string]$Evidence,
+        [string]$Priority,
+        [string]$RecommendedAction,
+        [string]$EvidenceIds
+    )
+
+    $finalScore = Limit-Score -Score $Score
+    $List.Add([PSCustomObject]@{
+        Level             = Get-ScoreLevel -Score $finalScore
+        Scenario          = $Scenario
+        Score             = $finalScore
+        Priority          = $Priority
+        Conclusion        = $Conclusion
+        Evidence          = $Evidence
+        EvidenceIds       = $EvidenceIds
+        RecommendedAction = $RecommendedAction
+    }) | Out-Null
+}
+
+function Add-CleanupAdvice {
+    param(
+        [System.Collections.Generic.List[object]]$List,
+        [string]$Priority,
+        [string]$RiskType,
+        [string]$Target,
+        [string]$Evidence,
+        [string]$SuggestedCommand,
+        [string]$SafetyNote
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Target)) { return }
+
+    foreach ($x in $List) {
+        if ($x.RiskType -eq $RiskType -and $x.Target -eq $Target -and $x.SuggestedCommand -eq $SuggestedCommand) {
+            return
+        }
+    }
+
+    $List.Add([PSCustomObject]@{
+        Priority         = $Priority
+        RiskType         = $RiskType
+        Target           = $Target
+        Evidence         = $Evidence
+        SuggestedCommand = $SuggestedCommand
+        SafetyNote       = $SafetyNote
+    }) | Out-Null
+}
+
+function Get-FirstPathFromText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $m = [regex]::Match($Text, '(?i)[A-Z]:\\[^"''<>|\r\n]+?\.(exe|dll|ps1|vbs|bat|cmd|hta|js|conf|ini|db|bak|dat|txt)')
+    if ($m.Success) { return $m.Value.Trim() }
+    return ""
+}
+
+function Get-SafeRegDeleteCommand {
+    param([string]$Location,[string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Location) -or [string]::IsNullOrWhiteSpace($Name)) { return "" }
+    if ($Location -match '^HKLM:\\(.+)$') { return "reg delete `"HKLM\$($Matches[1])`" /v `"$Name`" /f" }
+    if ($Location -match '^HKCU:\\(.+)$') { return "reg delete `"HKCU\$($Matches[1])`" /v `"$Name`" /f" }
+    return ""
+}
+
+function Resolve-ServiceNameForCommand {
+    param(
+        [string]$ServiceName,
+        [string]$ImagePath
+    )
+
+    # 7045 日志中的 ServiceName 在部分系统/语言环境里可能更像 DisplayName。
+    # sc.exe 更适合使用 Win32_Service.Name，所以这里尽量反查真实服务名。
+    try {
+        $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
+        foreach ($svc in $services) {
+            if ($svc.Name -eq $ServiceName) { return $svc.Name }
+        }
+        foreach ($svc in $services) {
+            if ($svc.DisplayName -eq $ServiceName) { return $svc.Name }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ImagePath)) {
+            $needle = ($ImagePath -replace '"','').Trim()
+            foreach ($svc in $services) {
+                $pn = ([string]$svc.PathName -replace '"','').Trim()
+                if ($pn -eq $needle -or $pn.Contains($needle) -or $needle.Contains($pn)) {
+                    return $svc.Name
+                }
+            }
+        }
+    } catch {}
+
+    return $ServiceName
+}
+
+function Get-StartupArtifactPath {
+    param(
+        [string]$Location,
+        [string]$Name,
+        [string]$Command
+    )
+
+    # 注册表启动项没有文件路径本体，删除建议应走 reg delete。
+    if ($Location -match '^HK') { return "" }
+
+    # Startup 文件夹中的 .lnk/.vbs/.bat 等，处置对象应是 Startup 目录里的文件本身，
+    # 不是快捷方式解析后的 wscript.exe 或 powershell.exe 命令行。
+    try {
+        if ((Test-Path $Location -PathType Container) -and -not [string]::IsNullOrWhiteSpace($Name)) {
+            return (Join-Path $Location $Name)
+        }
+    } catch {}
+
+    if ($Command -match '(?i)^[A-Z]:\\') { return $Command }
+    return ""
+}
+
+function Test-IsSystemInterpreterPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    return ($Path -match '(?i)^C:\\Windows\\(System32|SysWOW64)\\(wscript|cscript|mshta|powershell|powershell_ise|cmd|rundll32|regsvr32|wmic|schtasks|sc)\.exe$')
+}
+
+$EvidenceScores = New-Object System.Collections.Generic.List[object]
+$CleanupAdvices = New-Object System.Collections.Generic.List[object]
+$HighRiskHashTargets = New-Object System.Collections.Generic.List[object]
+
+# 1. 挖矿 / 资源滥用证据链评分
+$minerScore = 0
+$minerReasons = @()
+if (@($activeMinerProcessEvidence).Count -gt 0) { $minerScore += 30; $minerReasons += "存在资源异常/高 CPU 可疑进程" }
+if (@($minerConfigEvidence).Count -gt 0) { $minerScore += 30; $minerReasons += "发现矿池/钱包/资源劫持配置" }
+if (@($minerServiceEvidence).Count -gt 0) { $minerScore += 15; $minerReasons += "存在可疑服务关联" }
+if (@($SuspiciousTasks).Count -gt 0) { $minerScore += 10; $minerReasons += "存在可疑计划任务" }
+if (@($SuspiciousStartup).Count -gt 0) { $minerScore += 10; $minerReasons += "存在可疑启动项" }
+if (@($CustomAuthLogHits).Count -gt 0) { $minerScore += 5; $minerReasons += "存在自定义认证日志 IP 线索" }
+
+if ($minerScore -gt 0) {
+    Add-EvidenceScore -List $EvidenceScores -Scenario "挖矿 / 资源滥用" -Score $minerScore `
+        -Conclusion "根据资源异常、矿池配置和持久化线索综合评分。" `
+        -Evidence (($minerReasons | Sort-Object -Unique) -join "；") `
+        -Priority "优先确认是否仍在运行，然后处理服务/任务/启动项与配置文件。" `
+        -RecommendedAction "先留证与计算 Hash，再停止可疑进程，随后禁用相关服务/计划任务/启动项。" `
+        -EvidenceIds (Get-EvidenceIdsByTechnique -TechniqueIds @("T1496","T1543.003","T1053.005","T1547.001"))
+}
+
+# 2. 持久化证据链评分
+$persistenceScore = 0
+$persistenceReasons = @()
+if (@($ServiceEvents | Where-Object { $_.Level -in @("高危","中危") }).Count -gt 0) { $persistenceScore += 25; $persistenceReasons += "发现可疑服务安装/服务线索" }
+if (@($SuspiciousTasks).Count -gt 0) { $persistenceScore += 25; $persistenceReasons += "发现可疑计划任务" }
+if (@($SuspiciousStartup).Count -gt 0) { $persistenceScore += 25; $persistenceReasons += "发现可疑启动项" }
+if (@($AttackTimelineArray | Where-Object { $_.TechniqueId -in @("T1543.003","T1053.005","T1547.001") }).Count -ge 3) { $persistenceScore += 15; $persistenceReasons += "多类持久化技术同时出现" }
+if (@($MiningConfigsGroupedArray).Count -gt 0) { $persistenceScore += 10; $persistenceReasons += "持久化线索附近存在配置/IOC" }
+
+if ($persistenceScore -gt 0) {
+    Add-EvidenceScore -List $EvidenceScores -Scenario "持久化后门 / 自启动控制" -Score $persistenceScore `
+        -Conclusion "根据服务、计划任务、启动项及其与 IOC 的关联综合评分。" `
+        -Evidence (($persistenceReasons | Sort-Object -Unique) -join "；") `
+        -Priority "优先处理仍启用的服务和计划任务，再处理 Run/Startup。" `
+        -RecommendedAction "先导出任务 XML、服务配置和注册表项，再逐项禁用或删除。" `
+        -EvidenceIds (Get-EvidenceIdsByTechnique -TechniqueIds @("T1543.003","T1053.005","T1547.001"))
+}
+
+# 3. 账户入侵证据链评分
+$accountScore = 0
+$accountReasons = @()
+if (@($SuspiciousUsers | Where-Object { $_.Level -eq "高危" }).Count -gt 0) { $accountScore += 35; $accountReasons += "存在高危可疑账户" }
+if (@($HiddenAccounts).Count -gt 0) { $accountScore += 30; $accountReasons += "存在 Winlogon 隐藏账户项" }
+if (@($AccountSecurityEvents | Where-Object { $_.EventID -in @(4720,4732,4728) }).Count -gt 0) { $accountScore += 20; $accountReasons += "存在账户创建或敏感组变更事件" }
+if (@($RdpMembers).Count -gt 0) { $accountScore += 10; $accountReasons += "远程桌面用户组存在成员，需要复核" }
+if (@($FailedByIdentity | Where-Object { $_.TargetUser -match '(?i)hack|admin|svc_|\$' -and $_.FailedCount -ge 2 }).Count -gt 0) { $accountScore += 10; $accountReasons += "可疑账户存在登录失败痕迹" }
+
+# v0.7.1：隐藏账户是账户入侵高价值证据。只要命中 Winlogon 隐藏账户项，
+# 账户证据链最低提升到高危阈值，避免显示为“中危”而降低处置优先级。
+if (@($HiddenAccounts).Count -gt 0 -and $accountScore -lt 80) {
+    $accountScore = 80
+    $accountReasons += "Winlogon 隐藏账户触发高危阈值"
+}
+if (@($HiddenAccounts).Count -gt 0 -and @($SuspiciousUsers | Where-Object { $_.Level -eq "高危" }).Count -gt 0 -and $accountScore -lt 85) {
+    $accountScore = 85
+    $accountReasons += "隐藏账户与高危可疑账户同时存在"
+}
+
+if ($accountScore -gt 0) {
+    Add-EvidenceScore -List $EvidenceScores -Scenario "账户入侵 / 隐藏用户" -Score $accountScore `
+        -Conclusion "根据可疑账户、隐藏账户、组成员和账户事件综合评分。" `
+        -Evidence (($accountReasons | Sort-Object -Unique) -join "；") `
+        -Priority "优先确认隐藏账户和新增管理员组成员。" `
+        -RecommendedAction "留证后禁用未知账户，导出 Winlogon 隐藏账户注册表项，并复核 4720/4732/4624/4625。" `
+        -EvidenceIds (Get-EvidenceIdsByTechnique -TechniqueIds @("T1136","T1098","T1110"))
+}
+
+# 4. 凭证攻击 / 爆破证据链评分
+$credScore = 0
+$credReasons = @()
+$maxFailed = 0
+try { $maxFailed = [int](($FailedByIdentity | Measure-Object -Property FailedCount -Maximum).Maximum) } catch { $maxFailed = 0 }
+if ($maxFailed -ge 10) { $credScore += 35; $credReasons += "存在集中登录失败" }
+elseif ($maxFailed -ge 5) { $credScore += 25; $credReasons += "存在多次登录失败" }
+if (@($FailedByIP | Where-Object { $_.FailedCount -ge 5 }).Count -gt 0) { $credScore += 25; $credReasons += "存在按来源 IP 聚合的失败登录" }
+if (@($FailedByIdentity | Where-Object { $_.FailedCount -ge 5 }).Count -gt 0) { $credScore += 15; $credReasons += "存在按 Workstation/账户聚合的失败登录" }
+if ($RdpListening) { $credScore += 10; $credReasons += "RDP 端口处于监听状态" }
+if ($SmbListening) { $credScore += 10; $credReasons += "SMB 端口处于监听状态" }
+if (@($CustomAuthLogHits).Count -gt 0) { $credScore += 10; $credReasons += "存在自定义认证日志 IP 线索" }
+
+if ($credScore -gt 0) {
+    Add-EvidenceScore -List $EvidenceScores -Scenario "口令猜测 / 凭证攻击" -Score $credScore `
+        -Conclusion "根据 4625 登录失败、服务监听和自定义认证日志综合评分。" `
+        -Evidence (($credReasons | Sort-Object -Unique) -join "；") `
+        -Priority "优先确认是否存在真实来源 IP、成功登录和后续账户/持久化变化。" `
+        -RecommendedAction "导出登录失败明细，关联 4624 成功登录、RDP/SMB 访问和账户变更事件。" `
+        -EvidenceIds (Get-EvidenceIdsByTechnique -TechniqueIds @("T1110","T1021.001"))
+}
+
+# 5. PowerShell / 脚本执行证据链评分
+$scriptScore = 0
+$scriptReasons = @()
+if (@($PowerShellFindings | Where-Object { $_.Risk -in @("高危","中危") -or $_.Level -in @("高危","中危") }).Count -gt 0) { $scriptScore += 35; $scriptReasons += "存在高危 PowerShell/脚本日志特征" }
+if (@($SuspiciousStartup | Where-Object { $_.Command -match '(?i)powershell|wscript|cscript|mshta|\.vbs|\.hta|\.ps1|\.bat|\.cmd' }).Count -gt 0) { $scriptScore += 25; $scriptReasons += "启动项中存在脚本解释器或脚本文件" }
+if (@($SuspiciousTasks | Where-Object { $_.Actions -match '(?i)powershell|wscript|cscript|mshta|\.vbs|\.hta|\.ps1|\.bat|\.cmd' }).Count -gt 0) { $scriptScore += 25; $scriptReasons += "计划任务中存在脚本解释器或脚本文件" }
+if (@($MiningConfigsGroupedArray | Where-Object { $_.Type -match '下载/投放URL' }).Count -gt 0) { $scriptScore += 15; $scriptReasons += "发现下载/投放 URL 候选" }
+
+if ($scriptScore -gt 0) {
+    Add-EvidenceScore -List $EvidenceScores -Scenario "脚本执行 / 投放链路" -Score $scriptScore `
+        -Conclusion "根据 PowerShell/脚本日志、脚本型持久化和投放 URL 综合评分。" `
+        -Evidence (($scriptReasons | Sort-Object -Unique) -join "；") `
+        -Priority "优先复核脚本内容、执行来源和是否关联服务/任务/启动项。" `
+        -RecommendedAction "导出脚本文件、计算 Hash，检查是否包含下载执行、EncodedCommand、Bypass、mshta/wscript 链路。" `
+        -EvidenceIds (Get-EvidenceIdsByTechnique -TechniqueIds @("T1059.001","T1059.005","T1218.005"))
+}
+
+# 生成处置建议：仅输出建议，不自动执行
+foreach ($p in ($ResourceAnomalies | Where-Object { $_.Level -in @("高危","中危") } | Select-Object -First 20)) {
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P1" -RiskType "可疑进程" -Target "$($p.Name) PID=$($p.ProcessId)" `
+        -Evidence "CPU=$($p.CpuPercent)，路径=$($p.ExecutablePath)，标签=$($p.Tags)" `
+        -SuggestedCommand "Stop-Process -Id $($p.ProcessId) -Force" `
+        -SafetyNote "先确认进程路径、签名、Hash 和业务归属；生产环境不建议未经确认直接停止。"
+}
+
+foreach ($s in ($ServiceEvents | Where-Object { $_.Level -in @("高危","中危") } | Select-Object -First 30)) {
+    $svcCmdName = Resolve-ServiceNameForCommand -ServiceName $s.ServiceName -ImagePath $s.ImagePath
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P1" -RiskType "可疑服务" -Target "$($s.ServiceName) [ServiceName=$svcCmdName]" `
+        -Evidence "路径=$($s.ImagePath)，原因=$($s.Reason)" `
+        -SuggestedCommand "sc.exe stop `"$svcCmdName`" ; sc.exe config `"$svcCmdName`" start= disabled" `
+        -SafetyNote "先导出服务配置和服务文件 Hash；确认非业务服务后再禁用。命令优先使用 Win32_Service.Name，而不是显示名。"
+}
+
+foreach ($t in ($SuspiciousTasks | Select-Object -First 40)) {
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P2" -RiskType "可疑计划任务" -Target $t.TaskName `
+        -Evidence "动作=$($t.Actions)，原因=$($t.Reason)" `
+        -SuggestedCommand "schtasks /Change /TN `"$($t.TaskName)`" /Disable" `
+        -SafetyNote "建议先使用 schtasks /Query /TN 任务名 /XML 导出任务 XML 留证，确认后再禁用或删除。"
+}
+
+foreach ($st in ($SuspiciousStartup | Select-Object -First 40)) {
+    $cmd = ""
+    $artifactPath = Get-StartupArtifactPath -Location $st.Location -Name $st.Name -Command $st.Command
+
+    if ($st.Location -match '^HK') {
+        $cmd = Get-SafeRegDeleteCommand -Location $st.Location -Name $st.Name
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($artifactPath)) {
+        $cmd = "Remove-Item -LiteralPath `"$artifactPath`" -Force"
+    }
+    else {
+        $cmd = "# 请手工复核并备份后删除启动项：$($st.Name)"
+    }
+
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P2" -RiskType "可疑启动项" -Target $st.Name `
+        -Evidence "位置=$($st.Location)，启动项文件=$artifactPath，命令=$($st.Command)，原因=$($st.Reason)" `
+        -SuggestedCommand $cmd `
+        -SafetyNote "先导出注册表项或备份 Startup 文件；对于 .lnk，应删除 Startup 目录中的 .lnk 本体，不要删除系统解释器。"
+}
+
+foreach ($u in ($SuspiciousUsers | Where-Object { $_.Level -in @("高危","中危") } | Select-Object -First 20)) {
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P1" -RiskType "可疑账户" -Target $u.Name `
+        -Evidence "原因=$($u.Reasons)，隐藏=$($u.IsHidden)，管理员组=$($u.IsAdmin)，远程桌面组=$($u.IsRemoteDesktopUser)" `
+        -SuggestedCommand "Disable-LocalUser -Name `"$($u.Name)`"" `
+        -SafetyNote "先确认账户归属并导出账户/组成员/登录事件；未知高危账户优先禁用而不是直接删除。"
+}
+
+foreach ($h in ($HiddenAccounts | Select-Object -First 20)) {
+    Add-CleanupAdvice -List $CleanupAdvices -Priority "P1" -RiskType "Winlogon 隐藏账户" -Target $h.Account `
+        -Evidence "注册表=$($h.RegPath)，值=$($h.Value)" `
+        -SuggestedCommand "Remove-ItemProperty -Path `"$($h.RegPath)`" -Name `"$($h.Account)`"" `
+        -SafetyNote "先导出注册表项留证；确认不是业务隐藏账户后再删除该隐藏项。"
+}
+
+# 高危文件 Hash 建议目标
+$hashCandidates = @()
+$hashCandidates += @($ResourceAnomalies | Where-Object { $_.ExecutablePath } | ForEach-Object { $_.ExecutablePath })
+$hashCandidates += @($ServiceEvents | Where-Object { $_.Level -in @("高危","中危") } | ForEach-Object { Get-FirstPathFromText -Text $_.ImagePath })
+$hashCandidates += @($SuspiciousStartup | ForEach-Object {
+    $artifactPath = Get-StartupArtifactPath -Location $_.Location -Name $_.Name -Command $_.Command
+    if ($artifactPath) { $artifactPath }
+    $cmdPath = Get-FirstPathFromText -Text $_.Command
+    if ($cmdPath) { $cmdPath }
+})
+$hashCandidates += @($SuspiciousTasks | ForEach-Object { Get-FirstPathFromText -Text $_.Actions })
+$hashCandidates += @($MiningConfigFiles | ForEach-Object { $_.FilePath })
+
+foreach ($hp in ($hashCandidates | Where-Object { $_ -and ($_ -notmatch ':\w+$') } | Sort-Object -Unique | Select-Object -First 120)) {
+    if (Test-IsSystemInterpreterPath -Path $hp) { continue }
+
+    $exists = Test-Path $hp -PathType Leaf
+    $HighRiskHashTargets.Add([PSCustomObject]@{
+        FilePath           = $hp
+        Exists             = $exists
+        SuggestedCommand   = "Get-FileHash -Algorithm SHA256 -LiteralPath `"$hp`""
+        Note               = "优先计算 SHA256；必要时补充 MD5/SHA1 并进行威胁情报检索。系统解释器本体已降噪，重点关注被解释执行的脚本/配置/样本文件。"
+    }) | Out-Null
+}
+
+$EvidenceScoresArray = @($EvidenceScores | Sort-Object Score -Descending)
+$CleanupAdvicesArray = @($CleanupAdvices | Sort-Object Priority,RiskType,Target)
+$HighRiskHashTargetsArray = @($HighRiskHashTargets | Sort-Object FilePath -Unique)
+
+Export-DetailCsv -Name "证据链评分.csv" -Data $EvidenceScoresArray
+Export-DetailCsv -Name "处置建议.csv" -Data $CleanupAdvicesArray
+Export-DetailCsv -Name "高危文件Hash建议.csv" -Data $HighRiskHashTargetsArray
+
+# =========================================================
 # 输出报告
 # =========================================================
 
@@ -3334,6 +3693,17 @@ $summaryLines += "一、攻击场景判断"
 foreach ($s in $ScenariosArray) {
     $summaryLines += "[$($s.Level)] $($s.Scenario)：$($s.Conclusion)"
     $summaryLines += "证据：$($s.Evidence)"
+}
+$summaryLines += ""
+$summaryLines += "一-补充、v0.7 证据链评分"
+foreach ($es in ($EvidenceScoresArray | Select-Object -First 8)) {
+    $summaryLines += "[$($es.Level)] $($es.Scenario)：评分=$($es.Score)，优先级=$($es.Priority)"
+    $summaryLines += "证据：$($es.Evidence)"
+}
+$summaryLines += ""
+$summaryLines += "一-补充、处置建议预览"
+foreach ($ca in ($CleanupAdvicesArray | Select-Object -First 10)) {
+    $summaryLines += "[$($ca.Priority)] $($ca.RiskType)：$($ca.Target)；建议=$($ca.SuggestedCommand)"
 }
 $summaryLines += ""
 $summaryLines += "二、风险统计"
@@ -3386,11 +3756,15 @@ $summaryLines += "3. v0.6 新增 ATT&CK 映射和证据链编号，可用于报�
 5. 若「自定义认证日志IP线索」存在，请把它作为应用/实验日志辅助证据，不要直接等同于 Windows 4625 的真实来源 IP。
 6. 下载/投放 URL 与矿池地址已分开展示：前者用于追踪投放链路，后者用于研判资源劫持/挖矿配置。
 7. 若「ADS备用数据流线索」存在，请把 ADS 作为隐藏配置/规避痕迹优先复核；若无 ADS，不代表系统不存在 ADS，只代表候选文件轻量扫描未命中。
-8. 若「账户与恶意用户排查」出现隐藏账户、可疑命名账户、远程桌面用户组异常成员或非预期管理员账户，请优先留证、确认来源并结合 4720/4732/4624/4625 事件复核。普通管理员组成员会在成员表展示，但不会仅因'属于管理员组'被判为可疑账户。"
+8. 若「账户与恶意用户排查」出现隐藏账户、可疑命名账户、远程桌面用户组异常成员或非预期管理员账户，请优先留证、确认来源并结合 4720/4732/4624/4625 事件复核。普通管理员组成员会在成员表展示，但不会仅因'属于管理员组'被判为可疑账户。
+9. v0.7.1 修复处置建议命令生成：Startup LNK 删除建议指向 .lnk 本体，服务建议优先使用 ServiceName，系统解释器 Hash 降噪，隐藏账户证据链提升为高危。处置命令只作为人工复核建议，不会自动执行；生产环境请先留证、确认业务归属和变更窗口。"
 
 $summaryLines | Out-File -FilePath $SummaryPath -Encoding UTF8
 
 $scenarioForHtml = $ScenariosArray | Select-Object Level,Scenario,Conclusion,Evidence,Suggestion
+$evidenceScoreForHtml = $EvidenceScoresArray | Select-Object Level,Scenario,Score,Priority,Conclusion,Evidence,EvidenceIds,RecommendedAction
+$cleanupAdviceForHtml = $CleanupAdvicesArray | Select-Object Priority,RiskType,Target,Evidence,SuggestedCommand,SafetyNote
+$hashTargetsForHtml = $HighRiskHashTargetsArray | Select-Object FilePath,Exists,SuggestedCommand,Note
 $findingsForHtml = $FindingsArray | Select-Object Level,Category,Title,Evidence,Suggestion
 $securityForHtml = $SecuritySummary | Select-Object EventID,EventType,Count
 $suspiciousUsersForHtml = $SuspiciousUsers | Select-Object Level,Name,Enabled,Score,Reasons,IsHidden,IsAdmin,IsRemoteDesktopUser,IsCurrentUser,IsBuiltIn,LastLogon,PasswordLastSet,PasswordNeverExpires,UserMayChangePassword,Description,SID
@@ -3719,6 +4093,17 @@ $hashToolHtml
     <div class="section">
         <h2>一、攻击场景判断</h2>
         $(ConvertTo-HtmlTable -Data $scenarioForHtml -MaxRows 50)
+    </div>
+
+    <div class="section">
+        <h2>一-补充、v0.7 证据链评分与处置建议</h2>
+        <p class="empty">本节为 v0.7 新增能力。评分用于帮助判断处置优先级，不会自动执行清理命令；所有建议命令均需人工复核后再使用。</p>
+        <h3 style="color:#bfdbfe; margin-top:18px;">证据链评分</h3>
+        $(ConvertTo-HtmlTable -Data $evidenceScoreForHtml -MaxRows 30)
+        <h3 style="color:#bfdbfe; margin-top:18px;">处置建议生成器</h3>
+        $(ConvertTo-HtmlTable -Data $cleanupAdviceForHtml -MaxRows 100)
+        <h3 style="color:#bfdbfe; margin-top:18px;">高危文件 Hash 建议</h3>
+        $(ConvertTo-HtmlTable -Data $hashTargetsForHtml -MaxRows 100)
     </div>
 
     <div class="section">
