@@ -1,69 +1,151 @@
-# WinIR-Helper v0.7.1-beta
+# WinIR-Helper v0.8.8-beta
 
-本版本为 WinIR-Helper 第七代 beta 版本，重点增强了证据链评分、处置建议生成和高危文件 Hash 建议能力，并修复 v0.7.0 中部分处置命令生成不严谨的问题。
+## Release Title
 
-> 工具定位：Windows 应急响应辅助脚本，用于快速收集本机安全线索、整理攻击时间线、生成 HTML/TXT/CSV 报告。  
-> 本工具不执行查杀、不自动清理系统，不替代 EDR、杀毒软件或专业取证工具。
+WinIR-Helper v0.8.8-beta：模块化重构收口版
 
----
+## Release Notes
 
-## 核心更新
+本版本是 v0.8 模块化重构系列的收口修正版。v0.8 的主要目标不是继续堆叠检测规则，而是将 WinIR-Helper 从单文件应急脚本整理为更容易维护、更容易交付、更适合后续扩展的模块化工具。
 
-### 1. 新增证据链评分
+v0.8.8-beta 重点修复了 v0.8.7 中摘要建议文本换行导致的 PowerShell ParserError，并继续完善事件读取状态判断、虚拟化组件降噪和报告可信度。
 
-v0.7 系列新增证据链评分模块，可对不同攻击场景进行综合评分，包括：
+## 主要变化
 
-- 挖矿 / 资源滥用
-- 持久化后门 / 自启动控制
-- 账户入侵 / 隐藏用户
-- 口令猜测 / 凭证攻击
-- 脚本执行 / 投放链路
+### 1. 修复 v0.8.7 ParserError
 
-评分会结合进程、服务、计划任务、启动项、账户、日志、矿池配置、投放 URL 等线索，辅助判断风险优先级。
+修复 v0.8.7 中摘要建议文本跨行写入导致的 PowerShell 解析错误。
 
-### 2. 新增处置建议生成器
+现在 `dist/WinIR-Helper.ps1` 可以在 Windows PowerShell 5.1 下正常运行。
 
-报告中新增处置建议区域，支持生成以下类型建议：
+### 2. 区分 NoMatch 与 Failed
 
-- 可疑服务禁用建议
-- 可疑计划任务禁用建议
-- 可疑启动项删除建议
-- Winlogon 隐藏账户注册表项移除建议
-- 可疑账户禁用建议
-- 高危文件 Hash 计算建议
+事件读取状态现在分为：
 
-所有处置命令仅作为人工复核参考，不会自动执行。
+```text
+完成：成功读取到事件
+无匹配：日志可读取，但时间窗口内没有指定事件
+失败：权限、参数、通道不可读或查询语法异常
+```
 
-### 3. 修复 Startup LNK 处置建议
+这可以避免将“没有 RDP 1149 事件”或“没有 PowerShell 4103/4104 事件”误判为日志读取失败。
 
-修复 v0.7.0 中 Startup LNK 处置建议错误指向系统解释器的问题。
+### 3. 数据完整性判断优化
 
-现在对于 Startup 目录下的 `.lnk` 文件，会建议删除 `.lnk` 本体，而不是误删 `wscript.exe`、`powershell.exe` 等系统解释器。
+报告新增并完善“数据完整性与事件日志读取状态”模块，会展示：
 
-### 4. 修复服务处置建议
+* 日志通道是否可读取
+* 日志是否启用
+* 记录数量
+* 最新事件时间
+* 最新事件 ID
+* 每组查询的读取状态
+* 是否存在真正读取异常
 
-服务处置建议现在优先使用 `Win32_Service.Name`，避免仅使用 DisplayName 导致 `sc.exe stop` / `sc.exe config` 命令执行失败。
+只有真实查询失败才会影响数据完整性判断。
 
-### 5. 优化高危文件 Hash 建议
+### 4. Hyper-V / WSL / Docker / vmswitch 降噪
 
-降低系统解释器本体的噪音，例如：
+v0.8.8 默认对常见虚拟化和容器相关组件进行降噪，包括：
 
-- `wscript.exe`
-- `cmd.exe`
-- `powershell.exe`
-- `mshta.exe`
+* Hyper-V
+* WSL
+* Docker Desktop
+* vmswitch.sys
+* VMSMP
+* 虚拟交换机相关服务
 
-重点关注它们执行的脚本、配置文件和样本文件。
+这些组件不再被误判为随机命名驱动服务，也不会直接生成禁用建议。
 
-### 6. 增强隐藏账户评分
+### 5. 安全测试组件降噪
 
-当发现 Winlogon `SpecialAccounts\UserList` 隐藏账户项时，账户入侵证据链会提升到高危级别，避免隐藏账户被低估。
+继续对常见安全测试组件进行降噪，例如：
 
----
+* Acunetix
+* Nessus / Tenable
+* Npcap
+* BurpSuite / PortSwigger
+* 本地 localhost 服务
+* 本地代理和测试浏览器
 
-## 使用方法
+减少安全测试环境中的误报。
 
-以管理员身份打开 PowerShell，运行：
+### 6. 威胁项与暴露面风险分开
+
+报告首页现在分开展示：
+
+```text
+威胁高危项
+威胁中危项
+暴露面风险
+数据完整性
+```
+
+端口监听不再直接等同于入侵威胁。
+例如 3306、445、135、139 等端口会归入暴露面风险，需要结合 Windows 防火墙、云安全组、NAT、端口映射进一步确认是否对外开放。
+
+### 7. 处置建议更加保守
+
+所有处置命令仍然只作为人工复核建议，不会自动执行。
+
+对于系统服务、虚拟化组件、安全工具、反作弊驱动、扫描器组件，默认只建议复核签名、Hash、路径、创建时间和业务归属，不直接建议禁用。
+
+## 使用方式
+
+解压后运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\WinIR-Helper.ps1 -ExportDetails -CpuSampleSeconds 15
+.\Run-WinIR-Helper.cmd
+```
+
+或者运行 dist 单文件版：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\dist\WinIR-Helper.ps1"
+```
+
+指定扫描天数：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\dist\WinIR-Helper.ps1" -Days 30
+```
+
+导出详细 CSV：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\dist\WinIR-Helper.ps1" -ExportDetails
+```
+
+## 输出文件
+
+运行完成后会生成：
+
+```text
+WinIR_Report.html       HTML 应急响应报告
+WinIR_Summary.txt       文本摘要
+攻击场景判断.csv
+重点关注项.csv
+其他明细 CSV
+```
+
+## 项目结构
+
+```text
+WinIR-Helper.ps1                  模块化主入口
+modules/                          功能模块
+config/                           配置文件
+build/                            单文件打包脚本
+dist/WinIR-Helper.ps1             发布用单文件版
+Run-WinIR-Helper.cmd              一键运行入口
+```
+
+## 注意事项
+
+WinIR-Helper 是 Windows 应急响应辅助工具，不是杀毒软件，不会自动查杀或清理系统。
+
+报告中的风险项、评分和处置建议都需要人工复核。生产环境中请先留证，再确认业务归属和变更窗口，最后再执行禁用服务、删除任务或停止进程等操作。
+
+## 推荐升级
+
+建议 v0.8.x 用户升级到 v0.8.8-beta。
+该版本修复了 v0.8.7 的语法错误，并完成了 v0.8 模块化重构阶段的主要收口工作。
